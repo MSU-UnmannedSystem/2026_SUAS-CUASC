@@ -459,3 +459,17 @@ def test_close_stops_both_threads_quickly():
     assert not reader.is_alive()
     assert not heartbeat.is_alive()
     link.close()
+
+
+@pytest.mark.parametrize("device, serial", [
+    ("/dev/ttyTHS1", True),
+    ("/dev/ttyACM0", True),
+    ("COM3", True),
+    ("udp:127.0.0.1:14550", False),
+    ("udpin:0.0.0.0:14550", False),
+    ("tcp:127.0.0.1:5760", False),
+    ("TCP:127.0.0.1:5760", False),
+])
+def test_is_serial(device, serial):
+    link = Link(FakeMaster(), LinkConfig(device=device))
+    assert link.is_serial is serial

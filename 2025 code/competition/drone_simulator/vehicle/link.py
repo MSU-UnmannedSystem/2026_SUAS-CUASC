@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 # pyserial's SerialException subclasses OSError in 3.x; listed for older versions.
 _LINK_ERRORS = (OSError, SerialException)
 
+# pymavlink device prefixes that are network links rather than a serial port.
+_NETWORK_DEVICE_PREFIXES = ("udp", "tcp", "mcast")
+
 
 class LinkTimeoutError(Exception):
     """Raised when no acceptable autopilot heartbeat arrives before the connect timeout."""
@@ -419,6 +422,15 @@ class Link:
         ``age("HEARTBEAT")`` for that.
         """
         return self._is_up
+
+    @property
+    def is_serial(self) -> bool:
+        """bool: False only for network devices (udp*/tcp*/mcast), i.e. SITL-style links.
+
+        Anything that is not clearly a network device counts as serial, so
+        safety checks keyed on this err towards "real hardware".
+        """
+        return not self._config.device.lower().startswith(_NETWORK_DEVICE_PREFIXES)
 
     def send(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         """Sends one MAVLink message. The only way to write to the vehicle.
