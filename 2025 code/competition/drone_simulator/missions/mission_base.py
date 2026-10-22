@@ -5,6 +5,7 @@ import sys
 from competition.drone_simulator.vehicle.modes import change_mode, arm_drone
 from competition.drone_simulator.vehicle.upload import upload_waypoints
 
+# DEPRECATED: replaced by vehicle/link.py (Link). Remove when callers migrate (step 4).
 class HeartbeatThread(threading.Thread):
     """
     Sends MAVLink HEARTBEAT to the FC at HEARTBEAT_HZ continuously.
