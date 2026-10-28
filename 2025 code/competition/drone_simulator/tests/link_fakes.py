@@ -290,3 +290,85 @@ class MissionSim:
 
     def _on_ack(self, link, call):
         self.acks_received.append((call.args[2], self._mission_type(call, 3)))
+
+
+# --- simulated vehicle ------------------------------------------------------
+
+
+class SimVehicle:
+    """ArduCopter-like vehicle on a FakeLink, for whole-mission tests.
+
+    Handles DO_SET_MODE, arm/disarm, NAV_TAKEOFF, DO_SET_SERVO and
+    SET_MESSAGE_INTERVAL; answers parameter reads from ``params``; stores
+    missions via :class:`MissionSim`. Call :meth:`tick` periodically (e.g. with
+    the ``background`` fixture) to stream HEARTBEAT/GLOBAL_POSITION_INT, climb,
+    and emit MISSION_ITEM_REACHED in AUTO.
+    """
+
+    def __init__(self, link, climb_rate_m_s=40.0, reached_every_ticks=4):
+        self.link = link
+        self.mode = "STABILIZE"
+        self.armed = False
+        self.alt_m = 0.0
+        self.target_alt_m = None
+        self.climb_rate_m_s = climb_rate_m_s
+        self.reached_every_ticks = reached_every_ticks
+        self.params = {"WP_SPD_UP": 2.5}
+        self.missions = MissionSim(link)
+        self.mode_log = []
+        self.on_mode = {}          # mode name -> fn(vehicle) when entered
+        self.emit_reached = True
+        self._next_reached = None
+        self._ticks = 0
+        self._last_tick = time.monotonic()
+        self._lock = threading.Lock()
+        link.responder = self._on_command
+        link.handlers["param_request_read_send"] = self._on_param_read
+
+    def set_mode(self, name):
+        with self._lock:
+            self.mode = name
+            self.mode_log.append(name)
+        if name == "AUTO":
+            self._next_reached = 1
+        callback = self.on_mode.get(name)
+        if callback is not None:
+            callback(self)
+
+    def _on_param_read(self, link, call):
+        name = call.args[2].decode()
+        if name in self.params:
+            link.deliver(param_value(name, self.params[name]))
+
+    def _on_command(self, link, sent):
+        cmd, p = sent.command, sent.params
+        result = mavlink.MAV_RESULT_ACCEPTED
+        if cmd == mavlink.MAV_CMD_DO_SET_MODE:
+            names = {v: k for k, v in MODES.items()}
+            if int(p[1]) in names:
+                self.set_mode(names[int(p[1])])
+            else:
+                result = mavlink.MAV_RESULT_FAILED
+        elif cmd == mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+            self.armed = p[0] == 1
+        elif cmd == mavlink.MAV_CMD_NAV_TAKEOFF:
+            if self.armed and self.mode == "GUIDED" and self.alt_m < 1.0:
+                self.target_alt_m = p[6]
+            else:
+                result = mavlink.MAV_RESULT_FAILED
+        link.deliver(ack(cmd, result))
+        link.deliver(heartbeat(self.mode, self.armed))
+
+    def tick(self):
+        now = time.monotonic()
+        dt, self._last_tick = now - self._last_tick, now
+        self._ticks += 1
+        if self.target_alt_m is not None and self.alt_m < self.target_alt_m:
+            self.alt_m = min(self.target_alt_m, self.alt_m + self.climb_rate_m_s * dt)
+        self.link.deliver(heartbeat(self.mode, self.armed), position(self.alt_m))
+        if (self.mode == "AUTO" and self.emit_reached and self._next_reached is not None
+                and self._ticks % self.reached_every_ticks == 0):
+            stored = self.missions.stored.get(0, [])
+            if self._next_reached < len(stored):
+                self.link.deliver(mission_item_reached(self._next_reached))
+                self._next_reached += 1

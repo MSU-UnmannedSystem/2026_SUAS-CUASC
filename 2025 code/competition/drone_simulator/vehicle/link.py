@@ -678,6 +678,21 @@ class Link:
             return None, None
         return entry
 
+    def latest_fresh(self, msg_type: str, max_age_s: float) -> Optional[Any]:
+        """Returns the newest message of a type only if it is recent enough.
+
+        Args:
+            msg_type: MAVLink message name, e.g. ``"GLOBAL_POSITION_INT"``.
+            max_age_s: Maximum age in seconds.
+
+        Returns:
+            The message, or None if none has been seen or it is older than ``max_age_s``.
+        """
+        msg, rx_time = self.latest_with_time(msg_type)
+        if msg is None or time.monotonic() - rx_time > max_age_s:
+            return None
+        return msg
+
     def age(self, msg_type: str) -> float:
         """Returns how long ago a message type was last received from the target autopilot.
 

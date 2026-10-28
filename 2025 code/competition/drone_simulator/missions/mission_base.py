@@ -1,54 +1,42 @@
-from pymavlink import mavutil
+import contextlib
+import logging
+import queue
 import time
-import threading
-import sys
-from competition.drone_simulator.vehicle.modes import change_mode, arm_drone
-from competition.drone_simulator.vehicle.upload import upload_waypoints
 
-# DEPRECATED: replaced by vehicle/link.py (Link). Remove when callers migrate (step 4).
-class HeartbeatThread(threading.Thread):
-    """
-    Sends MAVLink HEARTBEAT to the FC at HEARTBEAT_HZ continuously.
-    Must be alive for the entire flight. Stopping it arms the GCS failsafe.
-    """
-    HEARTBEAT_HZ = 2
+from competition.drone_simulator.vehicle import commands, params
+from competition.drone_simulator.vehicle.upload import upload_waypoint_mission
 
-    def __init__(self, master):
-        super().__init__(daemon=True)
-        self.master = master
-        self._stop_event = threading.Event()
+logger = logging.getLogger(__name__)
 
-    def run(self):
-        period = 1.0 / self.HEARTBEAT_HZ
-        while not self._stop_event.is_set():
-            self.master.mav.heartbeat_send(
-                type=mavutil.mavlink.MAV_TYPE_GCS,
-                autopilot=mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                base_mode=0,
-                custom_mode=0,
-                system_status=mavutil.mavlink.MAV_STATE_ACTIVE,
-            )
-            time.sleep(period)
+# Position checks are skipped when GLOBAL_POSITION_INT is older than this.
+POSITION_MAX_AGE_S = 2.0
+HEARTBEAT_LOSS_S = 5.0
 
-    def stop(self):
-        self._stop_event.set()
+
+class PilotTakeover(Exception):
+    """The safety pilot switched to a manual mode; the companion must stop commanding."""
 
 
 class MissionBase():
+    """Base flight sequence on a Link: upload, GUIDED, arm, takeoff, execute, monitor, end.
+
+    The Link owns the GCS heartbeat; it keeps running until the caller closes
+    the link (after the end mode is confirmed).
+    """
 
     # If a safety officer takes over via RC, we log it and wait rather than abort.
     RC_OVERRIDE_MODES = {"STABILIZE", "ALT_HOLD", "LOITER", "LAND"}
 
-    def __init__(self, master, config):
-        self.master = master
+    def __init__(self, link, config):
+        self.link = link
         self.config = config
         self.takeoff_alt = None
         self.waypoints = None
+        self.last_nav_seq = None
         self.active = False
         self.start_time = None
         self.time_limit = self.config.get("time_limit", 600)
         self.last_waypoint = None
-        self.last_heartbeat = time.time()
         self.expected_mode = "AUTO"
         self.max_alt = self.config.get("max_alt", 120)
         self.min_alt = self.config.get("min_alt", 5)
@@ -57,7 +45,8 @@ class MissionBase():
 
         self._landing = False
 
-        self._heartbeat_thread = None
+        self._subscriptions = contextlib.ExitStack()
+        self._reached = None
 
     def run(self):
         """Main mission entry point"""
@@ -66,11 +55,9 @@ class MissionBase():
             self.arm_and_takeoff()
             self.execute()
 
-            self.start_time = time.time()
             self.active = True
 
             while self.active:
-                self.update_heartbeat()
                 self.monitor()
                 self.check_time_limit()
                 self.check_safety()
@@ -78,16 +65,16 @@ class MissionBase():
 
             self.end_mission()
 
+        except PilotTakeover as e:
+            # Send nothing more: the pilot is flying.
+            self._close_subscriptions()
+            logger.critical("Mission stopped, pilot has control (%s)", e)
         except Exception as e:
-            print(f"Mission failed: {e}")
+            logger.error("Mission failed: %s", e)
             self.abort()
 
     def setup(self):
-        """Prepare mission — validates config, starts heartbeat, uploads waypoints."""
-
-        self._heartbeat_thread = HeartbeatThread(self.master)
-        self._heartbeat_thread.start()
-        print(f"[BASE] GCS heartbeat thread started @ {HeartbeatThread.HEARTBEAT_HZ} Hz")
+        """Prepare mission — validates config, uploads and verifies waypoints."""
 
         if "takeoff_alt" not in self.config:
             raise ValueError("Missing takeoff_alt in mission config")
@@ -105,161 +92,136 @@ class MissionBase():
         if not isinstance(self.waypoints, list) or len(self.waypoints) == 0:
             raise ValueError("Waypoints must be a non-empty list")
 
-        upload_waypoints(self.master, self.waypoints)
-        print(f"[BASE] Waypoints uploaded. Target alt: {self.takeoff_alt}m | "
-              f"Waypoints: {len(self.waypoints)}")
+        self.last_nav_seq = upload_waypoint_mission(self.link, self.waypoints)
+        logger.info("Waypoints uploaded. Target alt: %sm | Waypoints: %d",
+                    self.takeoff_alt, len(self.waypoints))
+
+        # Open now so no MISSION_ITEM_REACHED can be missed; closed in end_mission/abort.
+        self._reached = self._subscriptions.enter_context(
+            self.link.subscribe("MISSION_ITEM_REACHED", maxsize=200))
 
     def execute(self):
-        """Switch to AUTO and wait for FC confirmation."""
-        print("[BASE] Starting mission — switching to AUTO")
-        change_mode(self.master, "AUTO")
+        """Switch to AUTO; set_mode waits for the autopilot to confirm it."""
+        logger.info("Starting mission — switching to AUTO")
+        commands.set_mode(self.link, "AUTO", timeout_s=10.0)
         self.set_expected_mode("AUTO")
-
-        start = time.time()
-        while True:
-            hb = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
-            if hb:
-                mode_str = mavutil.mode_string_v10(hb)
-                if mode_str == "AUTO":
-                    print("[BASE] AUTO mode confirmed")
-                    break
-            if time.time() - start > 10:
-                raise RuntimeError("Failed to enter AUTO mode within 10 seconds")
+        logger.info("AUTO mode confirmed")
 
     def monitor(self):
         """
         Monitor waypoint progress.
         """
-        msg = self.master.recv_match(type="MISSION_ITEM_REACHED", blocking=False)
-
-        if not msg:
+        if self._reached is None:
             return
+        while True:
+            try:
+                msg = self._reached.get(timeout=0)
+            except queue.Empty:
+                return
+            if msg.get_srcSystem() != self.link.target_system:
+                continue
 
-        reached = msg.seq
-        final_waypoint = len(self.waypoints) - 1
+            reached = msg.seq
+            self.last_waypoint = reached
+            logger.info("Waypoint reached: %d/%d", reached, self.last_nav_seq)
 
-        print(f"[BASE] Waypoint reached: {reached}/{final_waypoint}")
-
-        if reached >= final_waypoint:
-            print("[BASE] All waypoints reached — mission complete")
-            self.active = False
+            if reached >= self.last_nav_seq:
+                logger.info("All waypoints reached — mission complete")
+                self.active = False
 
     def arm_and_takeoff(self):
         """Standard arming and takeoff sequence."""
-        change_mode(self.master, "GUIDED")
+        # Read before arming: ArduPilot disarms again after DISARM_DELAY without a takeoff.
+        climb_rate_m_s = params.climb_speed_m_s(self.link)
+
+        commands.set_mode(self.link, "GUIDED")
         self.set_expected_mode("GUIDED")
-        arm_drone(self.master)
 
-        self.master.mav.command_long_send(
-            self.master.target_system,
-            self.master.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, self.takeoff_alt
-        )
+        # Competition clock starts at takeoff.
+        self.start_time = time.monotonic()
+        commands.arm(self.link)
 
-        start = time.time()
-        timeout = 30
-
-        while True:
-            msg = self.master.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
-
-            if msg:
-                alt = msg.relative_alt / 1000.0
-                print(f"[BASE] Altitude: {round(alt, 2)} m")
-
-                if alt >= self.takeoff_alt * 0.95:
-                    print("[BASE] Target altitude reached")
-                    break
-
-            if time.time() - start >= timeout:
-                raise RuntimeError("Takeoff timeout")
-
-            time.sleep(0.1)
+        commands.takeoff(self.link, self.takeoff_alt, climb_rate_m_s=climb_rate_m_s)
+        logger.info("Target altitude reached")
 
     def check_time_limit(self):
         """Enforce competition time limit."""
         if self.start_time is None:
             return
 
-        elapsed = time.time() - self.start_time
+        elapsed = time.monotonic() - self.start_time
         if elapsed >= self.time_limit:
-            print(f"[BASE] Time limit reached ({self.time_limit}s)")
+            logger.warning("Time limit reached (%ss)", self.time_limit)
             raise RuntimeError("Time limit exceeded")
 
     def abort(self):
-        """Failsafe — stop heartbeat then RTL/LAND."""
-        print("[BASE] Aborting mission")
-        self._stop_heartbeat()
-        self.end_mission()
+        """Failsafe — switch to the end mode, logging (not raising) any error."""
+        logger.warning("Aborting mission")
+        try:
+            self.end_mission()
+        except Exception as e:
+            logger.error("Abort could not set %s: %s", self.end_mode, e)
 
     def check_safety(self):
         """
         Safety checks: link loss, mode guard, altitude bounds, geofence.
+
+        Raises:
+            PilotTakeover: The mode changed to one of RC_OVERRIDE_MODES.
+            RuntimeError: Any other violation.
         """
-        hb = self.master.recv_match(type="HEARTBEAT", blocking=False)
+        if self.link.age("HEARTBEAT") > HEARTBEAT_LOSS_S:
+            raise RuntimeError("Lost vehicle heartbeat — link failure")
 
-        if hb:
-            self.last_heartbeat = time.time()
-            current_mode = mavutil.mode_string_v10(hb)
+        current_mode = commands.current_mode(self.link)
+        if current_mode != self.expected_mode:
+            if current_mode in self.RC_OVERRIDE_MODES:
+                logger.critical("RC Pilot Takeover Detected! Mode Switched to: %s", current_mode)
+                logger.critical("Terminating companion computer guidance loop immediately.")
+                self.active = False
+                raise PilotTakeover(current_mode)
+            raise RuntimeError(
+                f"Unexpected mode change: expected={self.expected_mode}, "
+                f"got={current_mode}"
+            )
 
-            if current_mode != self.expected_mode:
-                if current_mode in self.RC_OVERRIDE_MODES:
-                    # FIX: Total script termination to ensure RC safety pilot has 100% control
-                    print(f"\n[CRITICAL] RC Pilot Takeover Detected! Mode Switched to: {current_mode}")
-                    print("[SAFEGUARD] Terminating companion computer guidance loop immediately.")
-                    self.active = False
-                    sys.exit(0)
-                else:
-                    raise RuntimeError(
-                        f"Unexpected mode change: expected={self.expected_mode}, "
-                        f"got={current_mode}"
-                    )
-        else:
-            # Check for link loss
-            if time.time() - self.last_heartbeat > 5:
-                raise RuntimeError("Lost vehicle heartbeat — link failure")
+        if self.link.age("GLOBAL_POSITION_INT") > POSITION_MAX_AGE_S:
+            return
+        msg = self.link.latest("GLOBAL_POSITION_INT")
+        alt = msg.relative_alt / 1000.0
 
-        msg = self.master.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
-        if msg:
-            alt = msg.relative_alt / 1000.0
+        # Skip altitude floor check during landing/RTL descent
+        if not self._landing and alt < self.min_alt:
+            raise RuntimeError(f"Altitude below minimum ({alt:.1f}m < {self.min_alt}m)")
 
-            # Skip altitude floor check during landing/RTL descent
-            if not self._landing and alt < self.min_alt:
-                raise RuntimeError(f"Altitude below minimum ({alt:.1f}m < {self.min_alt}m)")
+        if alt > self.max_alt:
+            raise RuntimeError(f"Altitude above maximum ({alt:.1f}m > {self.max_alt}m)")
 
-            if alt > self.max_alt:
-                raise RuntimeError(f"Altitude above maximum ({alt:.1f}m > {self.max_alt}m)")
-
-            if self.geofence:
-                lat = msg.lat / 1e7
-                lon = msg.lon / 1e7
-                lat_min, lat_max, lon_min, lon_max = self.geofence
-                if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
-                    raise RuntimeError(f"Geofence violation: ({lat:.5f}, {lon:.5f})")
+        if self.geofence:
+            lat = msg.lat / 1e7
+            lon = msg.lon / 1e7
+            lat_min, lat_max, lon_min, lon_max = self.geofence
+            if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
+                raise RuntimeError(f"Geofence violation: ({lat:.5f}, {lon:.5f})")
 
     def end_mission(self):
         """
-        Clean shutdown — sets _landing flag, stops heartbeat, changes mode.
-        """
-        print("[BASE] Ending mission")
-        self._landing = True        # suppress min_alt check from here on
-        self._stop_heartbeat()
+        Clean shutdown — sets _landing, then switches to end_mode (confirmed).
 
-        print(f"[BASE] Switching to {self.end_mode}")
-        change_mode(self.master, self.end_mode)
+        Heartbeats keep running; the caller closes the Link once this returns.
+        """
+        logger.info("Ending mission")
+        self._landing = True        # suppress min_alt check from here on
+        self._close_subscriptions()
+
+        logger.info("Switching to %s", self.end_mode)
+        commands.set_mode(self.link, self.end_mode)
         self.set_expected_mode(self.end_mode)
         self.active = False
 
     def set_expected_mode(self, mode):
         self.expected_mode = mode
 
-    def update_heartbeat(self):
-        hb = self.master.recv_match(type="HEARTBEAT", blocking=False)
-        if hb:
-            self.last_heartbeat = time.time()
-
-    def _stop_heartbeat(self):
-        """Stop the GCS heartbeat thread if it's running."""
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.stop()
-            print("[BASE] GCS heartbeat stopped")
+    def _close_subscriptions(self):
+        self._subscriptions.close()
+        self._reached = None
