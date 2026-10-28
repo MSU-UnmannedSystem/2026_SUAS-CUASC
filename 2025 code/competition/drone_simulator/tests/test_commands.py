@@ -8,7 +8,7 @@ from competition.drone_simulator.vehicle import commands
 from competition.drone_simulator.vehicle.commands import (
     CommandDenied, CommandError, CommandTimeout, StateNotReached)
 from link_fakes import (
-    MODES, FakeLink, ack, heartbeat, later, position, statustext)
+    MODES, FakeLink, ack, heartbeat, later, position, servo_output, statustext)
 
 mavlink = mavutil.mavlink
 
@@ -333,3 +333,101 @@ def test_steps_are_logged(caplog):
     assert any("Sending MAV_CMD_COMPONENT_ARM_DISARM" in m for m in messages)
     assert any("accepted" in m for m in messages)
     assert "Armed" in messages
+
+
+# --- set_servo / send_position_target / current_mode ------------------------------
+
+
+class ServoBench:
+    """Vehicle whose servo outputs follow DO_SET_SERVO (unless ``stuck``)."""
+
+    def __init__(self, link, stuck=False, result=mavlink.MAV_RESULT_ACCEPTED):
+        self.link = link
+        self.outputs = {}
+        self.stuck = stuck
+        self.result = result
+        link.responder = self.respond
+
+    def respond(self, link, sent):
+        if sent.command == mavlink.MAV_CMD_DO_SET_SERVO:
+            if self.result == mavlink.MAV_RESULT_ACCEPTED and not self.stuck:
+                self.outputs[int(sent.params[0])] = int(sent.params[1])
+            link.deliver(ack(sent.command, self.result))
+
+    def tick(self):
+        self.link.deliver(servo_output(**{"servo%d_raw" % ch: pwm
+                                          for ch, pwm in self.outputs.items()}))
+
+
+def test_set_servo_verified_from_servo_output_raw(background):
+    link = FakeLink()
+    bench = ServoBench(link)
+    background(bench.tick, period_s=0.05)
+    time.sleep(0.1)
+    commands.set_servo(link, 6, 1900)
+    assert link.sent[0].command == mavlink.MAV_CMD_DO_SET_SERVO
+    assert link.sent[0].params[:2] == [6.0, 1900.0]
+
+
+def test_set_servo_not_streaming_only_warns(caplog):
+    link = FakeLink()
+    ServoBench(link)
+    with caplog.at_level(logging.WARNING, logger=commands.__name__):
+        commands.set_servo(link, 7, 1900)
+    assert any("unverified" in r.getMessage() for r in caplog.records)
+
+
+def test_set_servo_mismatch_raises(background):
+    link = FakeLink()
+    bench = ServoBench(link, stuck=True)
+    background(bench.tick, period_s=0.05)
+    time.sleep(0.1)
+    with pytest.raises(StateNotReached, match="servo6_raw is 1100"):
+        commands.set_servo(link, 6, 1900, timeout_s=0.3)
+
+
+def test_set_servo_stale_reading_from_before_send_is_not_proof():
+    link = FakeLink()
+    ServoBench(link, stuck=True)
+    link.deliver(servo_output(servo6_raw=1900))  # fresh (age < 2 s) but from before the send
+    with pytest.raises(StateNotReached):
+        commands.set_servo(link, 6, 1900, timeout_s=0.2)
+
+
+def test_set_servo_rejected():
+    link = FakeLink()
+    ServoBench(link, result=mavlink.MAV_RESULT_FAILED)
+    with pytest.raises(CommandDenied):
+        commands.set_servo(link, 6, 1900)
+
+
+@pytest.mark.parametrize("channel, pwm", [(0, 1500), (17, 1500), (6, 799), (6, 2201)])
+def test_set_servo_validation(channel, pwm):
+    link = FakeLink()
+    with pytest.raises(ValueError):
+        commands.set_servo(link, channel, pwm)
+    assert link.calls == []
+
+
+def test_send_position_target_arguments():
+    link = FakeLink()
+    commands.send_position_target(link, 350495780 / 1e7, -1181513480 / 1e7, 16.0)
+    (call,) = link.calls
+    assert call.method == "set_position_target_global_int_send"
+    assert call.args == (0, 1, 1, mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, 0b110111111000,
+                         350495780, -1181513480, 16.0, 0, 0, 0, 0, 0, 0, 0, 0)
+    assert link.sent == []  # not a COMMAND_LONG: no ACK expected
+
+
+def test_send_position_target_validation():
+    link = FakeLink()
+    with pytest.raises(ValueError):
+        commands.send_position_target(link, 95.0, 0.0, 10.0)
+    assert link.calls == []
+
+
+def test_current_mode():
+    link = FakeLink()
+    assert commands.current_mode(link) is None
+    link.deliver(heartbeat("LOITER", armed=True))
+    assert commands.current_mode(link) == "LOITER"
