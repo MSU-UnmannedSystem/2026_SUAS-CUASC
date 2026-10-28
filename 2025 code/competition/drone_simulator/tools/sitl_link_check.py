@@ -34,15 +34,12 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from competition.drone_simulator.config.mission_params import parameters
-from competition.drone_simulator.vehicle import commands
+from competition.drone_simulator.vehicle import commands, params
 from competition.drone_simulator.vehicle.commands import CommandDenied, CommandError
 from competition.drone_simulator.vehicle.link import Link, LinkConfig, LinkTimeoutError
 
 logger = logging.getLogger("sitl")
 mavlink = mavutil.mavlink
-
-STREAM_RATE_HZ = 5.0
-
 
 # --- helpers -----------------------------------------------------------------
 
@@ -185,56 +182,6 @@ def require_sitl(link: Link, args: argparse.Namespace) -> None:
                          "device, or --i-know-this-is-sitl for the pty bridge." % args.device)
 
 
-def request_position_stream(link: Link) -> None:
-    """Asks for GLOBAL_POSITION_INT on THIS link; SITL does not stream it to SERIAL1 by default."""
-    interval_us = 1e6 / STREAM_RATE_HZ
-    commands.command_long(link, mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                          [mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, interval_us])
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        if link.age("GLOBAL_POSITION_INT") < 1.0:
-            logger.info("GLOBAL_POSITION_INT streaming at %.0f Hz", STREAM_RATE_HZ)
-            return
-        time.sleep(0.1)
-    raise CommandError("SET_MESSAGE_INTERVAL accepted but no GLOBAL_POSITION_INT arrived")
-
-
-def read_param(link: Link, name: str, timeout_s: float = 2.0, retries: int = 3) -> Optional[float]:
-    """Reads one parameter; returns None if the autopilot has no parameter of that name."""
-    with link.subscribe("PARAM_VALUE") as sub:
-        for _ in range(retries):
-            link.send("param_request_read_send", link.target_system, link.target_component,
-                      name.encode("ascii"), -1)
-            deadline = time.monotonic() + timeout_s
-            while time.monotonic() < deadline:
-                try:
-                    msg = sub.get(timeout=max(0.01, deadline - time.monotonic()))
-                except queue.Empty:
-                    break
-                if msg.get_srcSystem() == link.target_system and msg.param_id == name:
-                    return msg.param_value
-    return None
-
-
-def set_param(link: Link, name: str, value: float, timeout_s: float = 3.0) -> None:
-    """Sets a parameter and waits for the PARAM_VALUE echo. SITL only."""
-    if link.is_serial:
-        raise PermissionError("set_param is only for SITL links")
-    with link.subscribe("PARAM_VALUE") as sub:
-        link.send("param_set_send", link.target_system, link.target_component,
-                  name.encode("ascii"), float(value), mavlink.MAV_PARAM_TYPE_REAL32)
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            try:
-                msg = sub.get(timeout=max(0.01, deadline - time.monotonic()))
-            except queue.Empty:
-                break
-            if msg.param_id == name and abs(msg.param_value - value) < 1e-3:
-                logger.info("Set %s = %g", name, value)
-                return
-    raise CommandError("No PARAM_VALUE confirming %s = %g" % (name, value))
-
-
 def arm_when_ready(link: Link, timeout_s: float = 120.0) -> None:
     """Retries arm() while SITL's EKF/GPS settle (pre-arm failures are expected for ~30 s)."""
     deadline = time.monotonic() + timeout_s
@@ -254,9 +201,10 @@ def climb_rate_m_s() -> float:
 
 
 def take_off(link: Link, alt_m: float) -> None:
+    climb_m_s = params.climb_speed_m_s(link, default_m_s=climb_rate_m_s())  # before arming
     commands.set_mode(link, "GUIDED")
     arm_when_ready(link)
-    commands.takeoff(link, alt_m, climb_rate_m_s=climb_rate_m_s())
+    commands.takeoff(link, alt_m, climb_rate_m_s=climb_m_s)
 
 
 def land_and_wait(link: Link, timeout_s: float = 90.0) -> None:
@@ -351,13 +299,13 @@ def check_failsafe(args: argparse.Namespace) -> int:
     with open_link(args) as link, Monitor(link) as monitor:
         require_sitl(link, args)
         my_gcs = None
-        for name in ("MAV_GCS_SYSID", "SYSID_MYGCS"):  # newer name first
-            value = read_param(link, name)
-            if value is not None:
-                my_gcs = (name, int(value))
-                break
-        fs_enable = read_param(link, "FS_GCS_ENABLE")
-        fs_timeout = read_param(link, "FS_GCS_TIMEOUT")
+        gcs_param = params.read_param(link, "MAV_GCS_SYSID", "SYSID_MYGCS")  # newer name first
+        if gcs_param is not None:
+            my_gcs = (gcs_param.name, int(gcs_param.value))
+        fs_enable_param = params.read_param(link, "FS_GCS_ENABLE")
+        fs_timeout_param = params.read_param(link, "FS_GCS_TIMEOUT")
+        fs_enable = fs_enable_param.value if fs_enable_param else None
+        fs_timeout = fs_timeout_param.value if fs_timeout_param else None
         logger.info("Autopilot GCS id param: %s | FS_GCS_ENABLE=%s | FS_GCS_TIMEOUT=%s s | "
                     "our source_system=%d", "%s=%d" % my_gcs if my_gcs else "NOT FOUND",
                     fs_enable, fs_timeout, args.source_system)
@@ -365,11 +313,10 @@ def check_failsafe(args: argparse.Namespace) -> int:
             if not args.enable_fs:
                 return result(None, "FS_GCS_ENABLE is 0, so the failsafe can't trigger. "
                               "Re-run with --enable-fs.")
-            set_param(link, "FS_GCS_ENABLE", 1)
+            params.set_param(link, "FS_GCS_ENABLE", 1)
         wait_s = (fs_timeout or 5.0) + 10.0
         expect_counted = my_gcs is not None and my_gcs[1] == args.source_system
 
-        request_position_stream(link)
         take_off(link, args.alt)
 
         logger.info("Other GCSs heartbeating right now: %s",
@@ -424,7 +371,6 @@ def check_failsafe(args: argparse.Namespace) -> int:
 def check_acks(args: argparse.Namespace) -> int:
     with open_link(args) as link, Monitor(link) as monitor:
         require_sitl(link, args)
-        request_position_stream(link)
 
         logger.info("--- DO_SET_MODE GUIDED (valid)")
         commands.set_mode(link, "GUIDED")
@@ -463,7 +409,6 @@ def check_acks(args: argparse.Namespace) -> int:
 def check_reconnect(args: argparse.Namespace) -> int:
     with open_link(args) as link:
         require_sitl(link, args)
-        request_position_stream(link)
         logger.info("Watching for %.0f s. Kill the link (Ctrl-C the pty bridge), wait ~10 s, "
                     "restart it.", args.duration)
         downs, ups = [], []

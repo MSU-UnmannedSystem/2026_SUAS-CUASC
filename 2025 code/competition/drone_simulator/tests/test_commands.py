@@ -1,7 +1,4 @@
-import collections
-import contextlib
 import logging
-import threading
 import time
 
 import pytest
@@ -10,146 +7,10 @@ from pymavlink import mavutil
 from competition.drone_simulator.vehicle import commands
 from competition.drone_simulator.vehicle.commands import (
     CommandDenied, CommandError, CommandTimeout, StateNotReached)
-from competition.drone_simulator.vehicle.link import Subscription
+from link_fakes import (
+    MODES, FakeLink, ack, heartbeat, later, position, statustext)
 
 mavlink = mavutil.mavlink
-MODES = mavutil.mode_mapping_byname(mavlink.MAV_TYPE_QUADROTOR)
-
-SentCommand = collections.namedtuple("SentCommand", "command confirmation params")
-
-
-# --- real pymavlink messages ------------------------------------------------
-
-
-def make_msg(sysid, compid, name, *fields):
-    encoder = mavlink.MAVLink(None, srcSystem=sysid, srcComponent=compid)
-    msg = getattr(encoder, name + "_encode")(*fields)
-    return mavlink.MAVLink(None).parse_buffer(bytes(msg.pack(encoder)))[0]
-
-
-def heartbeat(mode="GUIDED", armed=False, sysid=1, compid=1):
-    base_mode = mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-    if armed:
-        base_mode |= mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-    return make_msg(sysid, compid, "heartbeat", mavlink.MAV_TYPE_QUADROTOR,
-                    mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA, base_mode, MODES[mode],
-                    mavlink.MAV_STATE_ACTIVE)
-
-
-def ack(command, result, sysid=1):
-    return make_msg(sysid, 1, "command_ack", command, result)
-
-
-def statustext(text):
-    return make_msg(1, 1, "statustext", mavlink.MAV_SEVERITY_CRITICAL, text.encode())
-
-
-def position(rel_alt_m):
-    return make_msg(1, 1, "global_position_int", 1000, int(35.05 * 1e7), int(-118.15 * 1e7),
-                    int((700 + rel_alt_m) * 1000), int(rel_alt_m * 1000), 0, 0, 0, 0)
-
-
-# --- FakeLink ---------------------------------------------------------------
-
-
-class FakeLink:
-    """Implements the Link API used by commands.py; tests script the vehicle's replies.
-
-    ``responder(link, sent)`` is called for every COMMAND_LONG sent and may
-    ``deliver()`` messages, which go to open subscriptions and the cache
-    exactly like the real reader thread does.
-    """
-
-    target_system = 1
-    target_component = 1
-
-    def __init__(self, device="udp:127.0.0.1:14550", responder=None):
-        self.device = device
-        self.responder = responder
-        self.sent = []
-        self._cache = {}
-        self._subs = []
-        self._lock = threading.Lock()
-
-    @property
-    def is_serial(self):
-        return not self.device.startswith(("udp", "tcp", "mcast"))
-
-    def send(self, method_name, *args, **kwargs):
-        assert method_name == "command_long_send"
-        ts, tc, command, confirmation = args[:4]
-        assert (ts, tc) == (1, 1)
-        sent = SentCommand(command, confirmation, list(args[4:]))
-        self.sent.append(sent)
-        if self.responder is not None:
-            self.responder(self, sent)
-
-    def deliver(self, *msgs):
-        with self._lock:
-            for msg in msgs:
-                if msg.get_srcSystem() == self.target_system:
-                    self._cache[msg.get_type()] = (msg, time.monotonic())
-                for sub in self._subs:
-                    if msg.get_type() in sub.msg_types:
-                        sub._put(msg)
-
-    def cache_stale(self, msg, age_s):
-        """Puts ``msg`` in the cache as if it was received ``age_s`` seconds ago."""
-        with self._lock:
-            self._cache[msg.get_type()] = (msg, time.monotonic() - age_s)
-
-    @contextlib.contextmanager
-    def subscribe(self, *msg_types, maxsize=100):
-        sub = Subscription(frozenset(msg_types), maxsize)
-        with self._lock:
-            self._subs.append(sub)
-        try:
-            yield sub
-        finally:
-            with self._lock:
-                self._subs.remove(sub)
-
-    def latest(self, msg_type):
-        return self.latest_with_time(msg_type)[0]
-
-    def latest_with_time(self, msg_type):
-        with self._lock:
-            return self._cache.get(msg_type, (None, None))
-
-    def age(self, msg_type):
-        _, rx = self.latest_with_time(msg_type)
-        return float("inf") if rx is None else time.monotonic() - rx
-
-    def mode_mapping(self):
-        return dict(MODES)
-
-
-def later(delay_s, fn):
-    timer = threading.Timer(delay_s, fn)
-    timer.daemon = True
-    timer.start()
-    return timer
-
-
-@pytest.fixture
-def background():
-    """Runs ``fn`` every ``period_s`` in a thread until the test ends."""
-    stop = threading.Event()
-    threads = []
-
-    def start(fn, period_s=0.1):
-        def loop():
-            while not stop.is_set():
-                fn()
-                stop.wait(period_s)
-        t = threading.Thread(target=loop, daemon=True)
-        threads.append(t)
-        t.start()
-
-    yield start
-    stop.set()
-    for t in threads:
-        t.join(timeout=1)
 
 
 # --- command_long -----------------------------------------------------------
