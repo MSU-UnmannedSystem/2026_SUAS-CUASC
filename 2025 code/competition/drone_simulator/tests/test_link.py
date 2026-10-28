@@ -1,4 +1,5 @@
 import collections
+import errno
 import logging
 import queue
 import threading
@@ -279,7 +280,8 @@ def test_heartbeat_thread_survives_send_errors(caplog):
         with connect(master, heartbeat_hz=50):
             time.sleep(0.3)
     assert master.mav.count("heartbeat_send") > 0
-    assert sum("heartbeat send failed" in r.getMessage() for r in caplog.records) == 3
+    # 3 failures 20 ms apart: logged once (rate-limited to 1/s), and the thread kept going.
+    assert sum("heartbeat send failed" in r.getMessage() for r in caplog.records) == 1
 
 
 # --- reader thread / cache / subscriptions ---------------------------------
@@ -597,3 +599,123 @@ def test_keeper_rerequests_stale_stream_rate_limited(monkeypatch):
     finally:
         stop.set()
         feeder.join(1.0)
+
+
+# --- silence detection, TCP EOF, log rate limits -------------------------------
+
+
+def test_silence_marks_link_down_and_reopens(caplog):
+    first = FakeMaster([copter_heartbeat()])
+    second = FakeMaster()
+    masters = [first, second]
+
+    def factory(device, **kwargs):
+        return masters.pop(0) if masters else FakeMaster()
+
+    config = LinkConfig(device="fake", connect_timeout_s=2.0, stream_rates_hz={},
+                        required_streams=(), silence_timeout_s=0.5)
+    with caplog.at_level(logging.ERROR, logger=LINK_LOGGER):
+        with Link.connect(config, connection_factory=factory) as link:
+            assert link.is_up
+            assert wait_until(lambda: not link.is_up, timeout=1.5)   # 0.5 s of silence
+            assert any("silence" in r.getMessage() for r in caplog.records)
+            assert first.close_calls == 1
+            assert wait_until(lambda: link.is_up, timeout=2.0)       # reopened (second)
+            second.feed(copter_heartbeat())
+            assert wait_until(lambda: link.age("HEARTBEAT") < 0.2)
+
+
+def test_traffic_keeps_silence_timer_reset():
+    master = FakeMaster([copter_heartbeat()])
+    stop = threading.Event()
+
+    def vehicle():
+        while not stop.wait(0.1):
+            master.feed(copter_heartbeat())
+
+    t = threading.Thread(target=vehicle, daemon=True)
+    t.start()
+    try:
+        with connect(master, silence_timeout_s=0.5) as link:
+            time.sleep(1.5)
+            assert link.is_up
+            assert master.close_calls == 0
+    finally:
+        stop.set()
+        t.join(1.0)
+
+
+def test_other_systems_do_not_count_as_autopilot_traffic():
+    master = FakeMaster([copter_heartbeat()])
+    stop = threading.Event()
+
+    def gcs_only():
+        while not stop.wait(0.1):
+            master.feed(gcs_heartbeat())
+
+    t = threading.Thread(target=gcs_only, daemon=True)
+    t.start()
+    try:
+        with connect(master, silence_timeout_s=0.5) as link:
+            assert wait_until(lambda: not link.is_up, timeout=1.5)
+    finally:
+        stop.set()
+        t.join(1.0)
+
+
+class _ClosedSocket:
+    def __init__(self, error=None):
+        self.error = error
+
+    def recv(self, n):
+        if self.error is not None:
+            raise self.error
+        return b""  # peer closed
+
+    def close(self):
+        pass
+
+
+def make_tcp_master(sock):
+    tcp = object.__new__(mavutil.mavtcp)  # no real socket
+    tcp.port = sock
+    tcp.address = ("127.0.0.1", 5760)
+    tcp.autoreconnect = False
+    return tcp
+
+
+@pytest.mark.parametrize("sock", [
+    _ClosedSocket(),                                                    # EOF -> handle_eof
+    _ClosedSocket(ConnectionResetError(errno.ECONNRESET, "reset")),     # -> handle_disconnect
+])
+def test_tcp_peer_close_raises_instead_of_spinning(sock, capsys):
+    tcp = make_tcp_master(sock)
+    opened = Link._open(LinkConfig(device="tcp:127.0.0.1:5760"), lambda device, **kw: tcp)
+    assert opened is tcp
+    with pytest.raises(ConnectionResetError):
+        tcp.recv(16)
+    with pytest.raises(ConnectionResetError):
+        tcp.handle_eof()
+    with pytest.raises(ConnectionResetError):
+        tcp.handle_disconnect()
+    assert "EOF on TCP socket" not in capsys.readouterr().out
+
+
+def test_non_tcp_connections_are_not_patched():
+    master = FakeMaster()
+    Link._open(LinkConfig(device="fake"), lambda device, **kw: master)
+    assert "handle_eof" not in master.__dict__
+
+
+def test_heartbeat_failure_log_is_rate_limited(caplog):
+    master = FakeMaster([copter_heartbeat()])
+
+    def broken(*args, **kwargs):
+        raise OSError("port gone")
+
+    master.mav.heartbeat_send = broken
+    with caplog.at_level(logging.ERROR, logger=LINK_LOGGER):
+        with connect(master, heartbeat_hz=100):
+            time.sleep(1.5)  # ~150 failures
+    logged = sum("heartbeat send failed" in r.getMessage() for r in caplog.records)
+    assert 1 <= logged <= 2

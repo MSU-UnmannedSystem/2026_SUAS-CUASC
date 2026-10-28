@@ -56,6 +56,22 @@ class LinkStreamError(Exception):
     """Raised when a required telemetry stream never arrives after it was requested."""
 
 
+def _raise_on_tcp_close(master: Any) -> None:
+    """Makes a closed TCP peer raise instead of being reported as "no data".
+
+    With autoreconnect=False, pymavlink's mavtcp.recv() prints "EOF on TCP
+    socket" and returns b"" forever when the peer closes, so the reader spun
+    at 100% CPU and never reconnected. Raising ConnectionResetError (an
+    OSError) sends it through the normal reconnect path instead.
+    """
+    def closed(*_args: Any, **_kwargs: Any) -> None:
+        raise ConnectionResetError("TCP connection to %s closed by peer"
+                                   % (getattr(master, "address", "?"),))
+
+    master.handle_eof = closed
+    master.handle_disconnect = closed
+
+
 def _message_id(msg_type: str) -> int:
     msg_id = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_" + msg_type, None)
     if msg_id is None:
@@ -81,6 +97,9 @@ class LinkConfig:
         required_streams: Streams that must arrive within 3 s of being requested, or
             :meth:`Link.connect` raises :class:`LinkStreamError`. Each must be in
             ``stream_rates_hz``.
+        silence_timeout_s: Seconds without any message from the autopilot before the
+            link is treated as down and reopened. A pulled wire on a 3-wire UART is
+            silent rather than an error, so this is the only way to notice it.
     """
 
     device: str
@@ -100,8 +119,11 @@ class LinkConfig:
     stream_rates_hz: Dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_STREAM_RATES_HZ))
     required_streams: Tuple[str, ...] = ("GLOBAL_POSITION_INT",)
+    silence_timeout_s: float = 3.0
 
     def __post_init__(self) -> None:
+        if self.silence_timeout_s <= 0:
+            raise ValueError("silence_timeout_s must be > 0")
         if self.connect_timeout_s <= 0:
             raise ValueError("connect_timeout_s must be > 0")
         if self.heartbeat_hz <= 0:
@@ -148,6 +170,7 @@ class _HeartbeatThread(threading.Thread):
         self._link = link
         self._period = 1.0 / hz
         self._stop_event = threading.Event()
+        self._error_log = _RateLimiter(1.0)
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -162,7 +185,10 @@ class _HeartbeatThread(threading.Thread):
                         system_status=mavutil.mavlink.MAV_STATE_ACTIVE,
                     )
                 except Exception:
-                    logger.exception("GCS heartbeat send failed; will retry")
+                    suppressed = self._error_log.allow()
+                    if suppressed is not None:
+                        logger.exception("GCS heartbeat send failed; will retry "
+                                         "(%d similar suppressed)", suppressed)
             self._stop_event.wait(self._period)
 
     def stop(self) -> None:
@@ -254,6 +280,7 @@ class Link:
         self._close_lock = threading.Lock()
         self._closed = False
         self._is_up = False
+        self._last_rx = time.monotonic()  # last message from target_system
         self._target_system = 0
         self._target_component = 0
         self._stop_event = threading.Event()
@@ -304,6 +331,7 @@ class Link:
             hb = link._wait_for_autopilot()
             link._set_target(hb.get_srcSystem(), hb.get_srcComponent())
             link._cache_message(hb)
+            link._last_rx = time.monotonic()
             link._is_up = True
             link._start_reader()
             link._start_heartbeat()
@@ -317,12 +345,15 @@ class Link:
 
     @staticmethod
     def _open(config: LinkConfig, connection_factory: Callable[..., Any]) -> Any:
-        return connection_factory(
+        master = connection_factory(
             config.device,
             baud=config.baud,
             source_system=config.source_system,
             source_component=config.source_component,
         )
+        if isinstance(master, mavutil.mavtcp):
+            _raise_on_tcp_close(master)
+        return master
 
     def _wait_for_autopilot(self) -> Any:
         cfg = self._config
@@ -487,25 +518,29 @@ class Link:
             msg = self._master.recv_match(blocking=True, timeout=self._READ_TIMEOUT_S)
         except _LINK_ERRORS as exc:
             if not self._stop_event.is_set():
-                self._reconnect(exc)
+                self._reconnect("%s: %s" % (type(exc).__name__, exc))
             return
         if msg is None:
             # Guard against a connection that returns immediately instead of blocking.
             if time.monotonic() - start < 0.01:
                 self._stop_event.wait(0.01)
-            return
-        if msg.get_type() == "BAD_DATA":
-            return
-        try:
-            self._dispatch(msg)
-        except Exception:
-            suppressed = self._handler_error_log.allow()
-            if suppressed is not None:
-                logger.exception("Error handling received message (%d similar suppressed)",
-                                 suppressed)
+        elif msg.get_type() != "BAD_DATA":
+            try:
+                self._dispatch(msg)
+            except Exception:
+                suppressed = self._handler_error_log.allow()
+                if suppressed is not None:
+                    logger.exception("Error handling received message (%d similar suppressed)",
+                                     suppressed)
+        silent_s = time.monotonic() - self._last_rx
+        if (self._is_up and silent_s > self._config.silence_timeout_s
+                and not self._stop_event.is_set()):
+            self._reconnect("silence: nothing from sysid %d for %.1f s"
+                            % (self._target_system, silent_s))
 
     def _dispatch(self, msg: Any) -> None:
         if msg.get_srcSystem() == self._target_system:
+            self._last_rx = time.monotonic()
             self._cache_message(msg)
         msg_type = msg.get_type()
         # Put while holding the lock so nothing is queued after unsubscribe returns.
@@ -518,11 +553,10 @@ class Link:
         with self._cache_lock:
             self._cache[msg.get_type()] = (msg, time.monotonic())
 
-    def _reconnect(self, exc: BaseException) -> None:
+    def _reconnect(self, reason: str) -> None:
         """Marks the link down and reopens it with backoff until it succeeds or close()."""
         self._is_up = False
-        logger.error("Link to %s down (%s: %s); reconnecting",
-                     self._config.device, type(exc).__name__, exc)
+        logger.error("Link to %s down (%s); reconnecting", self._config.device, reason)
         with self._send_lock:
             try:
                 self._master.close()
@@ -546,6 +580,7 @@ class Link:
             with self._send_lock:
                 self._master = master
                 self._set_target(self._target_system, self._target_component)
+            self._last_rx = time.monotonic()  # fresh grace period for the new connection
             self._is_up = True
             logger.info("Link to %s recovered after %d attempt(s)", self._config.device, attempt)
             return
@@ -564,10 +599,11 @@ class Link:
 
     @property
     def is_up(self) -> bool:
-        """bool: True while the connection is open and readable.
+        """bool: False after an I/O error OR silence_timeout_s of silence, until the reopen succeeds.
 
-        This means the port is open, not that the autopilot is talking; use
-        ``age("HEARTBEAT")`` for that.
+        True means the port is open and the autopilot has sent something within
+        ``silence_timeout_s``; use ``age(msg_type)`` for how fresh a given
+        message is.
         """
         return self._is_up
 
