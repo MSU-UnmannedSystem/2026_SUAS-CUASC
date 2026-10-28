@@ -56,9 +56,11 @@ class LinkConfig:
     baud: int = 921600
 
     # ArduPilot's GCS failsafe only counts heartbeats from the system ID in
-    # SYSID_MYGCS (default 255), so source_system must match that param or the
-    # failsafe will not see us. TODO: verify in SITL (and check whether the
-    # param is named MAV_GCS_SYSID on the firmware we fly).
+    # MAV_GCS_SYSID (SYSID_MYGCS on older firmware; default 255), so
+    # source_system must match it or the failsafe will not see us. Verified in
+    # SITL 2026-10-28 (`tools/sitl_link_check.py failsafe`): with MAV_GCS_SYSID=255 our
+    # heartbeats alone held off the failsafe; it fired 5 s after they stopped.
+    # TODO: check which name/value the Cube's firmware uses (`tools/sitl_link_check.py params`).
     source_system: int = 255
     source_component: int = mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
     expected_sysid: Optional[int] = None
