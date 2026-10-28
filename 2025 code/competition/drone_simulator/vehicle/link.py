@@ -598,6 +598,16 @@ class Link:
         return self._target_component
 
     @property
+    def source_system(self) -> int:
+        """int: MAVLink system ID this link transmits as (``LinkConfig.source_system``)."""
+        return self._config.source_system
+
+    @property
+    def source_component(self) -> int:
+        """int: MAVLink component ID this link transmits as."""
+        return self._config.source_component
+
+    @property
     def is_up(self) -> bool:
         """bool: False after an I/O error OR silence_timeout_s of silence, until the reopen succeeds.
 

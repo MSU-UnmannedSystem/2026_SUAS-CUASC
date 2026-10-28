@@ -194,3 +194,99 @@ def later(delay_s, fn):
     timer.daemon = True
     timer.start()
     return timer
+
+
+# --- mission protocol -------------------------------------------------------
+
+
+class MissionSim:
+    """ArduPilot-like mission protocol on a FakeLink: stores items per mission_type.
+
+    Args:
+        link: The FakeLink to attach to.
+        order: seqs to request, in order (repeats allowed); default 0..count-1.
+        use_int: Request with MISSION_REQUEST_INT (True) or legacy MISSION_REQUEST.
+        ignore_counts: How many MISSION_COUNTs to ignore (simulates lost packets).
+        reject_with: MAV_MISSION_RESULT to ACK the COUNT with, instead of requesting.
+        silent: Never answer uploads.
+        noise: Messages delivered before each real reply (e.g. from other systems).
+        corrupt: ``fn(mission_type, seq, item_msg) -> item_msg`` applied on download.
+    """
+
+    def __init__(self, link, order=None, use_int=True, ignore_counts=0, reject_with=None,
+                 silent=False, noise=(), corrupt=None):
+        self.link = link
+        self.order = order
+        self.use_int = use_int
+        self.ignore_counts = ignore_counts
+        self.reject_with = reject_with
+        self.silent = silent
+        self.noise = list(noise)
+        self.corrupt = corrupt
+        self.stored = {}          # mission_type -> list of (frame, command, p1..p4, x, y, z)
+        self.counts_seen = 0
+        self.acks_received = []
+        self._pending = {}        # mission_type -> {"count": n, "plan": [...], "items": {}}
+        link.handlers.update({
+            "mission_count_send": self._on_count,
+            "mission_item_int_send": self._on_item,
+            "mission_request_list_send": self._on_request_list,
+            "mission_request_int_send": self._on_request_int,
+            "mission_ack_send": self._on_ack,
+        })
+
+    @staticmethod
+    def _mission_type(call, positional_index):
+        if "mission_type" in call.kwargs:
+            return call.kwargs["mission_type"]
+        return call.args[positional_index] if len(call.args) > positional_index else 0
+
+    def _reply(self, msg):
+        self.link.deliver(*self.noise)
+        self.link.deliver(msg)
+
+    def _request(self, mt, state):
+        if state["plan"]:
+            seq = state["plan"].pop(0)
+            self._reply(mission_request(seq, mt, use_int=self.use_int))
+        else:
+            self.stored[mt] = [state["items"][s] for s in range(state["count"])]
+            self._reply(mission_ack(mavlink.MAV_MISSION_ACCEPTED, mt))
+
+    def _on_count(self, link, call):
+        self.counts_seen += 1
+        if self.silent or self.counts_seen <= self.ignore_counts:
+            return
+        count, mt = call.args[2], self._mission_type(call, 3)
+        if self.reject_with is not None:
+            self._reply(mission_ack(self.reject_with, mt))
+            return
+        plan = list(self.order) if self.order is not None else list(range(count))
+        self._pending[mt] = {"count": count, "plan": plan, "items": {}}
+        self._request(mt, self._pending[mt])
+
+    def _on_item(self, link, call):
+        a = call.args
+        mt = self._mission_type(call, 14)
+        state = self._pending.get(mt)
+        if state is None:
+            return
+        seq = a[2]
+        state["items"][seq] = (a[3], a[4], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[6])
+        self._request(mt, state)
+
+    def _on_request_list(self, link, call):
+        mt = self._mission_type(call, 2)
+        self._reply(mission_count(len(self.stored.get(mt, [])), mt))
+
+    def _on_request_int(self, link, call):
+        seq, mt = call.args[2], self._mission_type(call, 3)
+        frame, command, p1, p2, p3, p4, x, y, z, autocontinue = self.stored[mt][seq]
+        msg = mission_item_int(seq, frame, command, p1, p2, p3, p4, x, y, z, mt,
+                               autocontinue=autocontinue)
+        if self.corrupt is not None:
+            msg = self.corrupt(mt, seq, msg)
+        self._reply(msg)
+
+    def _on_ack(self, link, call):
+        self.acks_received.append((call.args[2], self._mission_type(call, 3)))
