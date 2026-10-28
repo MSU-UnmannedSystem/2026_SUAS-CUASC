@@ -7,7 +7,8 @@ import time
 import pytest
 from pymavlink import mavutil
 
-from competition.drone_simulator.vehicle.link import Link, LinkConfig, LinkTimeoutError
+from competition.drone_simulator.vehicle.link import (
+    Link, LinkConfig, LinkStreamError, LinkTimeoutError)
 
 mavlink = mavutil.mavlink
 LINK_LOGGER = "competition.drone_simulator.vehicle.link"
@@ -34,8 +35,9 @@ def copter_heartbeat(sysid=1):
 class FakeMav:
     """Stands in for master.mav: records sends and detects overlapping calls."""
 
-    def __init__(self, send_delay=0.0):
+    def __init__(self, send_delay=0.0, on_send=None):
         self.send_delay = send_delay
+        self.on_send = on_send
         self.sent = []
         self.overlap_detected = False
         self._active = 0
@@ -53,6 +55,8 @@ class FakeMav:
         finally:
             with self._guard:
                 self._active -= 1
+        if self.on_send is not None:
+            self.on_send(name, args, kwargs)
 
     def heartbeat_send(self, *args, **kwargs):
         self._record("heartbeat_send", args, kwargs)
@@ -73,11 +77,12 @@ class FakeMaster:
     Tests push more messages with feed() and simulate a dead port with fail().
     """
 
-    def __init__(self, messages=(), repeat=None, repeat_interval=0.02, send_delay=0.0):
+    def __init__(self, messages=(), repeat=None, repeat_interval=0.02, send_delay=0.0,
+                 on_send=None):
         self.queue = collections.deque(messages)
         self.repeat = repeat
         self.repeat_interval = repeat_interval
-        self.mav = FakeMav(send_delay=send_delay)
+        self.mav = FakeMav(send_delay=send_delay, on_send=on_send)
         self.target_system = 0
         self.target_component = 0
         self.close_calls = 0
@@ -125,7 +130,10 @@ def factory_for(master):
 
 
 def connect(master, **config_kwargs):
+    """Connects with stream requests off unless a test asks for them."""
     config_kwargs.setdefault("connect_timeout_s", 2.0)
+    config_kwargs.setdefault("stream_rates_hz", {})
+    config_kwargs.setdefault("required_streams", ())
     config = LinkConfig(device="fake", **config_kwargs)
     return Link.connect(config, connection_factory=factory_for(master))
 
@@ -421,7 +429,8 @@ def test_reconnects_with_backoff_after_link_error():
             raise OSError("No such file or directory: 'fake'")
         return second
 
-    config = LinkConfig(device="fake", connect_timeout_s=2.0)
+    config = LinkConfig(device="fake", connect_timeout_s=2.0, stream_rates_hz={},
+                        required_streams=())
     with Link.connect(config, connection_factory=factory) as link:
         first.feed(position(35.01))
         assert wait_until(lambda: link.latest("GLOBAL_POSITION_INT") is not None)
@@ -473,3 +482,118 @@ def test_close_stops_both_threads_quickly():
 def test_is_serial(device, serial):
     link = Link(FakeMaster(), LinkConfig(device=device))
     assert link.is_serial is serial
+
+
+# --- stream requests ----------------------------------------------------------
+
+SET_INTERVAL = mavlink.MAV_CMD_SET_MESSAGE_INTERVAL
+
+
+def interval_requests(master):
+    """(msg_id, interval_us) of every SET_MESSAGE_INTERVAL sent, in order."""
+    return [(int(args[4]), args[5]) for name, args, _ in list(master.mav.sent)
+            if name == "command_long_send" and args[2] == SET_INTERVAL]
+
+
+def autopilot(stream_types=("GLOBAL_POSITION_INT",), result=mavlink.MAV_RESULT_ACCEPTED,
+              ack=True):
+    """FakeMaster that ACKs SET_MESSAGE_INTERVAL and starts sending the named streams."""
+    holder = {}
+    samples = {
+        mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT: lambda: position(35.0),
+        mavlink.MAVLINK_MSG_ID_ATTITUDE: lambda: make_msg(1, 1, "attitude", 0, 0, 0, 0, 0, 0, 0),
+    }
+    wanted = {getattr(mavlink, "MAVLINK_MSG_ID_" + t) for t in stream_types}
+
+    def on_send(name, args, kwargs):
+        if name != "command_long_send" or args[2] != SET_INTERVAL:
+            return
+        master = holder["master"]
+        if ack:
+            master.feed(make_msg(1, 1, "command_ack", SET_INTERVAL, result))
+        msg_id = int(args[4])
+        if msg_id in wanted and msg_id in samples:
+            master.feed(samples[msg_id]())
+
+    holder["master"] = FakeMaster([copter_heartbeat()], on_send=on_send)
+    return holder["master"]
+
+
+def test_connect_requests_default_streams():
+    master = autopilot()
+    config = LinkConfig(device="fake", connect_timeout_s=2.0)
+    with Link.connect(config, connection_factory=factory_for(master)) as link:
+        assert link.latest("GLOBAL_POSITION_INT") is not None
+        assert link._stream_thread.is_alive()
+    expected = [(getattr(mavlink, "MAVLINK_MSG_ID_" + name), 1e6 / rate)
+                for name, rate in config.stream_rates_hz.items()]
+    assert interval_requests(master) == expected
+    assert (mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 100000.0) in expected
+    assert (mavlink.MAVLINK_MSG_ID_VFR_HUD, 250000.0) in expected
+
+
+def test_missing_required_stream_raises_and_closes():
+    master = autopilot(stream_types=())
+    start = time.monotonic()
+    with pytest.raises(LinkStreamError, match="GLOBAL_POSITION_INT"):
+        connect(master, stream_rates_hz={"GLOBAL_POSITION_INT": 10.0},
+                required_streams=("GLOBAL_POSITION_INT",))
+    assert time.monotonic() - start < 5.0
+    assert master.close_calls == 1
+
+
+def test_rejected_or_unacked_stream_request_is_logged(caplog, monkeypatch):
+    monkeypatch.setattr(Link, "_STREAM_ACK_TIMEOUT_S", 0.1)
+    for master, text in ((autopilot(result=mavlink.MAV_RESULT_FAILED), "rejected"),
+                         (autopilot(ack=False), "No ACK")):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=LINK_LOGGER):
+            with connect(master, stream_rates_hz={"GLOBAL_POSITION_INT": 10.0},
+                         required_streams=("GLOBAL_POSITION_INT",)):
+                pass
+        assert any(text in r.getMessage() and "GLOBAL_POSITION_INT" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_config_validates_streams():
+    with pytest.raises(ValueError, match="NOT_A_MESSAGE"):
+        LinkConfig(device="fake", stream_rates_hz={"NOT_A_MESSAGE": 1.0}, required_streams=())
+    with pytest.raises(ValueError):
+        LinkConfig(device="fake", stream_rates_hz={"ATTITUDE": 0.0}, required_streams=())
+    with pytest.raises(ValueError, match="VFR_HUD"):
+        LinkConfig(device="fake", stream_rates_hz={"ATTITUDE": 1.0}, required_streams=("VFR_HUD",))
+
+
+def test_keeper_rerequests_stale_stream_rate_limited(monkeypatch):
+    monkeypatch.setattr(Link, "_STREAM_CHECK_PERIOD_S", 0.05)
+    monkeypatch.setattr(Link, "_STREAM_STALE_MIN_S", 0.3)
+    monkeypatch.setattr(Link, "_STREAM_REREQUEST_MIN_S", 0.5)
+    monkeypatch.setattr(Link, "_HEARTBEAT_FRESH_S", 0.3)
+    master = autopilot(stream_types=("GLOBAL_POSITION_INT",))  # ATTITUDE never comes
+    attitude_id = mavlink.MAVLINK_MSG_ID_ATTITUDE
+    position_id = mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT
+    stop = threading.Event()
+
+    def vehicle():  # heartbeat + position keep flowing
+        while not stop.wait(0.05):
+            master.feed(copter_heartbeat(), position(35.0))
+
+    feeder = threading.Thread(target=vehicle, daemon=True)
+    feeder.start()
+    try:
+        with connect(master, stream_rates_hz={"GLOBAL_POSITION_INT": 10.0, "ATTITUDE": 10.0},
+                     required_streams=("GLOBAL_POSITION_INT",)):
+            time.sleep(2.0)
+            ids = [i for i, _ in interval_requests(master)]
+            attitude_rerequests = ids.count(attitude_id) - 1
+            assert 2 <= attitude_rerequests <= 4       # every >= 0.5 s, not every 0.05 s
+            assert ids.count(position_id) == 1          # fresh stream left alone
+
+            stop.set()                                  # autopilot goes silent
+            time.sleep(0.5)
+            before = len(interval_requests(master))
+            time.sleep(1.0)
+            assert len(interval_requests(master)) == before
+    finally:
+        stop.set()
+        feeder.join(1.0)
