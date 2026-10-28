@@ -131,10 +131,11 @@ def factory_for(master):
 
 
 def connect(master, **config_kwargs):
-    """Connects with stream requests off unless a test asks for them."""
+    """Connects with stream requests and silence detection off unless a test asks for them."""
     config_kwargs.setdefault("connect_timeout_s", 2.0)
     config_kwargs.setdefault("stream_rates_hz", {})
     config_kwargs.setdefault("required_streams", ())
+    config_kwargs.setdefault("silence_timeout_s", 10.0)
     config = LinkConfig(device="fake", **config_kwargs)
     return Link.connect(config, connection_factory=factory_for(master))
 
