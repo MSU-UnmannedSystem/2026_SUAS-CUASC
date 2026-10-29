@@ -1,13 +1,15 @@
-from pymavlink import mavutil
 import time
 import csv
 from competition.drone_simulator.missions.mission_base import MissionBase
+from competition.drone_simulator.vehicle import commands
 from competition.jetson_rescue.geolocation import TargetGeolocator
 from inference.camera import VisionPipeline
 
+TELEMETRY_MAX_AGE_S = 1.0  # older position/attitude counts as no data
+
 class ObjectLocalizationMission(MissionBase):
-    def __init__(self, master, config, desk_test=False):
-        super().__init__(master, config)
+    def __init__(self, link, config, desk_test=False):
+        super().__init__(link, config)
         self.desk_test = desk_test
         self.geolocator = TargetGeolocator(res_w=1920, res_h=1080, hfov_deg=65.0, vfov_deg=39.4)
         
@@ -27,8 +29,7 @@ class ObjectLocalizationMission(MissionBase):
         if self.desk_test:
             print("[LOCALIZATION] DESK TEST MODE: Skipping physical takeoff wait.")
             self.set_expected_mode("AUTO")
-            from competition.drone_simulator.vehicle.modes import arm_drone
-            arm_drone(self.master)
+            commands.arm(self.link)
             time.sleep(2)
         else:
             super().arm_and_takeoff()
@@ -36,8 +37,7 @@ class ObjectLocalizationMission(MissionBase):
     def execute(self):
         print("[LOCALIZATION] Entering Passive Monitoring. Drone is flying AUTO path.")
         if not self.desk_test:
-            from competition.drone_simulator.vehicle.modes import change_mode
-            change_mode(self.master, "AUTO")
+            commands.set_mode(self.link, "AUTO")
         self.set_expected_mode("AUTO")
 
     def monitor(self):
@@ -51,8 +51,8 @@ class ObjectLocalizationMission(MissionBase):
         current_time = time.time()
         
         if pixel_x is not None and (current_time - self.last_log_time > 2.0):
-            pos_msg = self.master.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
-            att_msg = self.master.recv_match(type="ATTITUDE", blocking=False)
+            pos_msg = self.link.latest_fresh("GLOBAL_POSITION_INT", TELEMETRY_MAX_AGE_S)
+            att_msg = self.link.latest_fresh("ATTITUDE", TELEMETRY_MAX_AGE_S)
             
             if pos_msg and att_msg:
                 current_lat = pos_msg.lat / 1e7

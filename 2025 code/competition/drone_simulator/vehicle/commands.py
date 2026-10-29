@@ -419,3 +419,100 @@ def takeoff(link: Link, alt_m: float, climb_rate_m_s: float = 2.5) -> float:
         if now >= deadline:
             raise StateNotReached("Takeoff did not reach %.1f m" % target_m, timeout_s)
         time.sleep(_POLL_INTERVAL_S)
+
+
+SERVO_MIN_PWM_US = 800
+SERVO_MAX_PWM_US = 2200
+SERVO_STREAM_FRESH_S = 2.0
+POSITION_TARGET_TYPE_MASK = 0b110111111000  # use lat/lon/alt only
+
+
+def current_mode(link: Link) -> Optional[str]:
+    """Returns the flight mode name from the latest autopilot HEARTBEAT, e.g. ``"GUIDED"``.
+
+    Args:
+        link: Connected link.
+
+    Returns:
+        The mode name (``mavutil.mode_string_v10``), or None if no HEARTBEAT yet.
+    """
+    hb = link.latest("HEARTBEAT")
+    return None if hb is None else mavutil.mode_string_v10(hb)
+
+
+def set_servo(link: Link, channel: int, pwm_us: int, timeout_s: float = 1.5) -> None:
+    """Sets a servo output with MAV_CMD_DO_SET_SERVO and checks the output changed.
+
+    If SERVO_OUTPUT_RAW is streaming, waits for a fresh one showing
+    ``servo{channel}_raw == pwm_us``. If it is not streaming, only logs a
+    warning (the ACK is all there is to go on).
+
+    Args:
+        link: Connected link.
+        channel: Servo output number, 1 to 16 (e.g. 6 for SERVO6 / "ch6out").
+        pwm_us: Pulse width in microseconds, 800 to 2200.
+        timeout_s: Seconds to wait for SERVO_OUTPUT_RAW to show the new value.
+
+    Raises:
+        ValueError: ``channel`` or ``pwm_us`` out of range (nothing is sent).
+        CommandDenied: Rejected (e.g. the output is assigned to another function).
+        CommandTimeout: No ACK.
+        StateNotReached: SERVO_OUTPUT_RAW is streaming but never showed ``pwm_us``.
+    """
+    if not 1 <= channel <= 16:
+        raise ValueError("servo channel must be 1-16, got %r" % (channel,))
+    if not SERVO_MIN_PWM_US <= pwm_us <= SERVO_MAX_PWM_US:
+        raise ValueError("pwm_us must be %d-%d, got %r"
+                         % (SERVO_MIN_PWM_US, SERVO_MAX_PWM_US, pwm_us))
+    logger.info("Setting servo %d to %d us", channel, pwm_us)
+    sent_at = time.monotonic()
+    command_long(link, mavlink.MAV_CMD_DO_SET_SERVO, [channel, pwm_us])
+    if link.age("SERVO_OUTPUT_RAW") > SERVO_STREAM_FRESH_S:
+        logger.warning("SERVO_OUTPUT_RAW not streaming; servo %d = %d us accepted but unverified",
+                       channel, pwm_us)
+        return
+    field_name = "servo%d_raw" % channel
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while True:
+        msg, rx = link.latest_with_time("SERVO_OUTPUT_RAW")
+        if msg is not None and rx > sent_at:
+            last = getattr(msg, field_name, None)
+            if last is None:  # MAVLink1 SERVO_OUTPUT_RAW has only servo1-8
+                logger.warning("SERVO_OUTPUT_RAW has no %s; servo %d unverified",
+                               field_name, channel)
+                return
+            if last == pwm_us:
+                logger.info("Servo %d confirmed at %d us", channel, pwm_us)
+                return
+        if time.monotonic() >= deadline:
+            raise StateNotReached("%s is %s us, expected %d us" % (field_name, last, pwm_us),
+                                  timeout_s)
+        time.sleep(_POLL_INTERVAL_S)
+
+
+def send_position_target(link: Link, lat_deg: float, lon_deg: float, alt_m: float) -> None:
+    """Sends one SET_POSITION_TARGET_GLOBAL_INT (GUIDED mode go-to).
+
+    Fire-and-forget: the MAVLink protocol has no ACK for this message, so
+    nothing is confirmed here; watch GLOBAL_POSITION_INT for progress.
+    Position-only type_mask 0b110111111000, frame GLOBAL_RELATIVE_ALT_INT.
+
+    Args:
+        link: Connected link.
+        lat_deg: Target latitude in degrees (sent as round(lat_deg * 1e7)).
+        lon_deg: Target longitude in degrees.
+        alt_m: Target altitude in metres above home.
+
+    Raises:
+        ValueError: lat/lon out of range (nothing is sent).
+    """
+    if not (abs(lat_deg) <= 90 and abs(lon_deg) <= 180):
+        raise ValueError("lat/lon (%r, %r) out of range" % (lat_deg, lon_deg))
+    # round(), not int(): callers often pass int_value / 1e7, which int() could
+    # truncate one unit low.
+    link.send("set_position_target_global_int_send", 0,
+              link.target_system, link.target_component,
+              mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, POSITION_TARGET_TYPE_MASK,
+              int(round(lat_deg * 1e7)), int(round(lon_deg * 1e7)), float(alt_m),
+              0, 0, 0, 0, 0, 0, 0, 0)

@@ -6,6 +6,11 @@ GCS heartbeat thread and mission code can share the port safely. A single
 reader thread is the only code that reads from the connection; it keeps a
 latest-value cache (:meth:`Link.latest`, :meth:`Link.age`) and feeds
 per-caller queues (:meth:`Link.subscribe`).
+
+ArduPilot only sends HEARTBEAT on a port until someone asks for streams, so
+:meth:`Link.connect` requests ``LinkConfig.stream_rates_hz`` with
+SET_MESSAGE_INTERVAL, and a keeper thread re-requests any stream that goes
+stale while the autopilot is still heartbeating (e.g. after a Cube reboot).
 """
 
 import contextlib
@@ -13,7 +18,7 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 from pymavlink import mavutil
@@ -31,9 +36,47 @@ _LINK_ERRORS = (OSError, SerialException)
 # pymavlink device prefixes that are network links rather than a serial port.
 _NETWORK_DEVICE_PREFIXES = ("udp", "tcp", "mcast")
 
+# Telemetry requested on connect, in Hz.
+DEFAULT_STREAM_RATES_HZ = {
+    "GLOBAL_POSITION_INT": 10.0,
+    "ATTITUDE": 10.0,
+    "VFR_HUD": 4.0,
+    "SYS_STATUS": 2.0,
+    "GPS_RAW_INT": 2.0,
+    "MISSION_CURRENT": 2.0,
+    "SERVO_OUTPUT_RAW": 2.0,
+}
+
 
 class LinkTimeoutError(Exception):
     """Raised when no acceptable autopilot heartbeat arrives before the connect timeout."""
+
+
+class LinkStreamError(Exception):
+    """Raised when a required telemetry stream never arrives after it was requested."""
+
+
+def _raise_on_tcp_close(master: Any) -> None:
+    """Makes a closed TCP peer raise instead of being reported as "no data".
+
+    With autoreconnect=False, pymavlink's mavtcp.recv() prints "EOF on TCP
+    socket" and returns b"" forever when the peer closes, so the reader spun
+    at 100% CPU and never reconnected. Raising ConnectionResetError (an
+    OSError) sends it through the normal reconnect path instead.
+    """
+    def closed(*_args: Any, **_kwargs: Any) -> None:
+        raise ConnectionResetError("TCP connection to %s closed by peer"
+                                   % (getattr(master, "address", "?"),))
+
+    master.handle_eof = closed
+    master.handle_disconnect = closed
+
+
+def _message_id(msg_type: str) -> int:
+    msg_id = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_" + msg_type, None)
+    if msg_id is None:
+        raise ValueError("Unknown MAVLink message type %r" % msg_type)
+    return msg_id
 
 
 @dataclass
@@ -50,6 +93,13 @@ class LinkConfig:
         expected_sysid: If set, only accept autopilot heartbeats from this system ID.
         connect_timeout_s: Seconds to wait for an autopilot heartbeat in :meth:`Link.connect`.
         heartbeat_hz: Rate of our outgoing GCS heartbeats, in Hz.
+        stream_rates_hz: Telemetry to request on connect, message name -> rate in Hz.
+        required_streams: Streams that must arrive within 3 s of being requested, or
+            :meth:`Link.connect` raises :class:`LinkStreamError`. Each must be in
+            ``stream_rates_hz``.
+        silence_timeout_s: Seconds without any message from the autopilot before the
+            link is treated as down and reopened. A pulled wire on a 3-wire UART is
+            silent rather than an error, so this is the only way to notice it.
     """
 
     device: str
@@ -58,20 +108,33 @@ class LinkConfig:
     # ArduPilot's GCS failsafe only counts heartbeats from the system ID in
     # MAV_GCS_SYSID (SYSID_MYGCS on older firmware; default 255), so
     # source_system must match it or the failsafe will not see us. Verified in
-    # SITL 2026-10-28 (`sitl.checks failsafe`): with MAV_GCS_SYSID=255 our
+    # SITL 2026-10-28 (`tools/sitl_link_check.py failsafe`): with MAV_GCS_SYSID=255 our
     # heartbeats alone held off the failsafe; it fired 5 s after they stopped.
-    # TODO: check which name/value the Cube's firmware uses (`sitl.checks params`).
+    # TODO: check which name/value the Cube's firmware uses (`tools/sitl_link_check.py params`).
     source_system: int = 255
     source_component: int = mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
     expected_sysid: Optional[int] = None
     connect_timeout_s: float = 30.0
     heartbeat_hz: float = 2.0
+    stream_rates_hz: Dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_STREAM_RATES_HZ))
+    required_streams: Tuple[str, ...] = ("GLOBAL_POSITION_INT",)
+    silence_timeout_s: float = 3.0
 
     def __post_init__(self) -> None:
+        if self.silence_timeout_s <= 0:
+            raise ValueError("silence_timeout_s must be > 0")
         if self.connect_timeout_s <= 0:
             raise ValueError("connect_timeout_s must be > 0")
         if self.heartbeat_hz <= 0:
             raise ValueError("heartbeat_hz must be > 0")
+        for name, rate_hz in self.stream_rates_hz.items():
+            _message_id(name)
+            if rate_hz <= 0:
+                raise ValueError("stream rate for %s must be > 0 Hz" % name)
+        missing = [n for n in self.required_streams if n not in self.stream_rates_hz]
+        if missing:
+            raise ValueError("required_streams not in stream_rates_hz: %s" % ", ".join(missing))
 
 
 class _RateLimiter:
@@ -107,6 +170,7 @@ class _HeartbeatThread(threading.Thread):
         self._link = link
         self._period = 1.0 / hz
         self._stop_event = threading.Event()
+        self._error_log = _RateLimiter(1.0)
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -121,7 +185,10 @@ class _HeartbeatThread(threading.Thread):
                         system_status=mavutil.mavlink.MAV_STATE_ACTIVE,
                     )
                 except Exception:
-                    logger.exception("GCS heartbeat send failed; will retry")
+                    suppressed = self._error_log.allow()
+                    if suppressed is not None:
+                        logger.exception("GCS heartbeat send failed; will retry "
+                                         "(%d similar suppressed)", suppressed)
             self._stop_event.wait(self._period)
 
     def stop(self) -> None:
@@ -186,6 +253,12 @@ class Link:
     _CLOSE_TIMEOUT_S = 0.9
     _READ_TIMEOUT_S = 0.2
     _RECONNECT_BACKOFF_S = (0.5, 1.0, 2.0, 4.0, 5.0)
+    _STREAM_ACK_TIMEOUT_S = 1.5
+    _REQUIRED_STREAM_WAIT_S = 3.0
+    _STREAM_CHECK_PERIOD_S = 1.0
+    _STREAM_STALE_MIN_S = 3.0        # a stream is stale after max(3 / rate, this)
+    _STREAM_REREQUEST_MIN_S = 5.0    # per stream
+    _HEARTBEAT_FRESH_S = 3.0
 
     def __init__(
         self,
@@ -207,11 +280,15 @@ class Link:
         self._close_lock = threading.Lock()
         self._closed = False
         self._is_up = False
+        self._last_rx = time.monotonic()  # last message from target_system
         self._target_system = 0
         self._target_component = 0
         self._stop_event = threading.Event()
         self._heartbeat_thread = None  # type: Optional[_HeartbeatThread]
         self._reader_thread = None  # type: Optional[threading.Thread]
+        self._stream_thread = None  # type: Optional[threading.Thread]
+        self._stream_requested_at = {}  # type: Dict[str, float]
+        self._stream_log = {}  # type: Dict[str, _RateLimiter]
         self._cache = {}  # type: Dict[str, Tuple[Any, float]]
         self._cache_lock = threading.Lock()
         self._subscriptions = []  # type: List[Subscription]
@@ -230,7 +307,8 @@ class Link:
         Waits for a HEARTBEAT that comes from an autopilot (not a GCS such as
         Mission Planner, whose heartbeats ArduPilot forwards between ports),
         targets its system/component ID, then starts the reader and GCS
-        heartbeat threads.
+        heartbeat threads, requests ``config.stream_rates_hz`` and waits for
+        ``config.required_streams``, then starts the stream keeper.
 
         Args:
             config: Connection settings.
@@ -239,11 +317,13 @@ class Link:
                 connection after a link error. Injectable for tests.
 
         Returns:
-            A connected ``Link`` with its reader and heartbeat threads running.
+            A connected ``Link`` with its reader, heartbeat and stream threads running.
 
         Raises:
             LinkTimeoutError: No acceptable heartbeat within ``config.connect_timeout_s``
                 seconds. The connection is closed before raising.
+            LinkStreamError: A required stream did not arrive within 3 s of being
+                requested. The connection is closed before raising.
         """
         master = cls._open(config, connection_factory)
         link = cls(master, config, connection_factory)
@@ -251,9 +331,13 @@ class Link:
             hb = link._wait_for_autopilot()
             link._set_target(hb.get_srcSystem(), hb.get_srcComponent())
             link._cache_message(hb)
+            link._last_rx = time.monotonic()
             link._is_up = True
             link._start_reader()
             link._start_heartbeat()
+            link._request_streams()
+            link._wait_for_required_streams()
+            link._start_stream_keeper()
         except BaseException:
             link.close()
             raise
@@ -261,12 +345,15 @@ class Link:
 
     @staticmethod
     def _open(config: LinkConfig, connection_factory: Callable[..., Any]) -> Any:
-        return connection_factory(
+        master = connection_factory(
             config.device,
             baud=config.baud,
             source_system=config.source_system,
             source_component=config.source_component,
         )
+        if isinstance(master, mavutil.mavtcp):
+            _raise_on_tcp_close(master)
+        return master
 
     def _wait_for_autopilot(self) -> Any:
         cfg = self._config
@@ -319,6 +406,96 @@ class Link:
             target=self._reader_loop, name="link-reader", daemon=True)
         self._reader_thread.start()
 
+    # --- streams ---------------------------------------------------------------
+
+    def _send_message_interval(self, msg_type: str, rate_hz: float) -> None:
+        interval_us = 1e6 / rate_hz
+        self.send("command_long_send", self._target_system, self._target_component,
+                  mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                  float(_message_id(msg_type)), interval_us, 0, 0, 0, 0, 0)
+        self._stream_requested_at[msg_type] = time.monotonic()
+
+    def _request_stream_acked(self, msg_type: str, rate_hz: float) -> Optional[int]:
+        """Requests one stream and waits for its COMMAND_ACK. Never call from the reader."""
+        with self.subscribe("COMMAND_ACK") as sub:
+            self._send_message_interval(msg_type, rate_hz)
+            deadline = time.monotonic() + self._STREAM_ACK_TIMEOUT_S
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    ack = sub.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if (ack.get_srcSystem() == self._target_system
+                        and ack.command == mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL):
+                    return ack.result
+        return None
+
+    def _request_streams(self) -> None:
+        for msg_type, rate_hz in self._config.stream_rates_hz.items():
+            result = self._request_stream_acked(msg_type, rate_hz)
+            if result is None:
+                logger.warning("No ACK for SET_MESSAGE_INTERVAL %s @ %g Hz", msg_type, rate_hz)
+            elif result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                logger.warning("SET_MESSAGE_INTERVAL %s @ %g Hz rejected: result %d",
+                               msg_type, rate_hz, result)
+            else:
+                logger.debug("Streaming %s @ %g Hz", msg_type, rate_hz)
+
+    def _wait_for_required_streams(self) -> None:
+        required = self._config.required_streams
+        deadline = time.monotonic() + self._REQUIRED_STREAM_WAIT_S
+        while True:
+            missing = [n for n in required if self.latest(n) is None]
+            if not missing:
+                if required:
+                    logger.info("Required streams arriving: %s", ", ".join(required))
+                return
+            if time.monotonic() >= deadline:
+                raise LinkStreamError(
+                    "Required stream(s) not received within %.1f s of SET_MESSAGE_INTERVAL: %s"
+                    % (self._REQUIRED_STREAM_WAIT_S, ", ".join(missing)))
+            time.sleep(0.05)
+
+    def _start_stream_keeper(self) -> None:
+        if not self._config.stream_rates_hz:
+            return
+        self._stream_thread = threading.Thread(
+            target=self._stream_keeper_loop, name="link-streams", daemon=True)
+        self._stream_thread.start()
+
+    def _stream_keeper_loop(self) -> None:
+        # Fire-and-forget only: ACKs are delivered by the reader thread, so this
+        # loop (and the reader) must never block waiting for one.
+        while not self._stop_event.wait(self._STREAM_CHECK_PERIOD_S):
+            try:
+                self._check_streams()
+            except Exception:
+                suppressed = self._loop_error_log.allow()
+                if suppressed is not None:
+                    logger.exception("Stream keeper error (%d similar suppressed)", suppressed)
+
+    def _check_streams(self) -> None:
+        if not self._is_up or self.age("HEARTBEAT") >= self._HEARTBEAT_FRESH_S:
+            return  # link down or autopilot silent: re-requesting can't help
+        now = time.monotonic()
+        for msg_type, rate_hz in self._config.stream_rates_hz.items():
+            stale_after_s = max(3.0 / rate_hz, self._STREAM_STALE_MIN_S)
+            age_s = self.age(msg_type)
+            requested_ago_s = now - self._stream_requested_at.get(msg_type, float("-inf"))
+            if age_s <= stale_after_s or requested_ago_s < max(stale_after_s,
+                                                              self._STREAM_REREQUEST_MIN_S):
+                continue
+            log = self._stream_log.setdefault(msg_type, _RateLimiter(60.0))
+            suppressed = log.allow()
+            if suppressed is not None:
+                logger.warning("%s stale (age %.1f s) while autopilot is heartbeating; "
+                               "re-requesting @ %g Hz (%d similar suppressed)",
+                               msg_type, age_s, rate_hz, suppressed)
+            self._send_message_interval(msg_type, rate_hz)
+
     # --- reader thread -------------------------------------------------------
 
     def _reader_loop(self) -> None:
@@ -341,25 +518,29 @@ class Link:
             msg = self._master.recv_match(blocking=True, timeout=self._READ_TIMEOUT_S)
         except _LINK_ERRORS as exc:
             if not self._stop_event.is_set():
-                self._reconnect(exc)
+                self._reconnect("%s: %s" % (type(exc).__name__, exc))
             return
         if msg is None:
             # Guard against a connection that returns immediately instead of blocking.
             if time.monotonic() - start < 0.01:
                 self._stop_event.wait(0.01)
-            return
-        if msg.get_type() == "BAD_DATA":
-            return
-        try:
-            self._dispatch(msg)
-        except Exception:
-            suppressed = self._handler_error_log.allow()
-            if suppressed is not None:
-                logger.exception("Error handling received message (%d similar suppressed)",
-                                 suppressed)
+        elif msg.get_type() != "BAD_DATA":
+            try:
+                self._dispatch(msg)
+            except Exception:
+                suppressed = self._handler_error_log.allow()
+                if suppressed is not None:
+                    logger.exception("Error handling received message (%d similar suppressed)",
+                                     suppressed)
+        silent_s = time.monotonic() - self._last_rx
+        if (self._is_up and silent_s > self._config.silence_timeout_s
+                and not self._stop_event.is_set()):
+            self._reconnect("silence: nothing from sysid %d for %.1f s"
+                            % (self._target_system, silent_s))
 
     def _dispatch(self, msg: Any) -> None:
         if msg.get_srcSystem() == self._target_system:
+            self._last_rx = time.monotonic()
             self._cache_message(msg)
         msg_type = msg.get_type()
         # Put while holding the lock so nothing is queued after unsubscribe returns.
@@ -372,11 +553,10 @@ class Link:
         with self._cache_lock:
             self._cache[msg.get_type()] = (msg, time.monotonic())
 
-    def _reconnect(self, exc: BaseException) -> None:
+    def _reconnect(self, reason: str) -> None:
         """Marks the link down and reopens it with backoff until it succeeds or close()."""
         self._is_up = False
-        logger.error("Link to %s down (%s: %s); reconnecting",
-                     self._config.device, type(exc).__name__, exc)
+        logger.error("Link to %s down (%s); reconnecting", self._config.device, reason)
         with self._send_lock:
             try:
                 self._master.close()
@@ -400,6 +580,7 @@ class Link:
             with self._send_lock:
                 self._master = master
                 self._set_target(self._target_system, self._target_component)
+            self._last_rx = time.monotonic()  # fresh grace period for the new connection
             self._is_up = True
             logger.info("Link to %s recovered after %d attempt(s)", self._config.device, attempt)
             return
@@ -417,11 +598,22 @@ class Link:
         return self._target_component
 
     @property
-    def is_up(self) -> bool:
-        """bool: True while the connection is open and readable.
+    def source_system(self) -> int:
+        """int: MAVLink system ID this link transmits as (``LinkConfig.source_system``)."""
+        return self._config.source_system
 
-        This means the port is open, not that the autopilot is talking; use
-        ``age("HEARTBEAT")`` for that.
+    @property
+    def source_component(self) -> int:
+        """int: MAVLink component ID this link transmits as."""
+        return self._config.source_component
+
+    @property
+    def is_up(self) -> bool:
+        """bool: False after an I/O error OR silence_timeout_s of silence, until the reopen succeeds.
+
+        True means the port is open and the autopilot has sent something within
+        ``silence_timeout_s``; use ``age(msg_type)`` for how fresh a given
+        message is.
         """
         return self._is_up
 
@@ -485,6 +677,21 @@ class Link:
         if entry is None:
             return None, None
         return entry
+
+    def latest_fresh(self, msg_type: str, max_age_s: float) -> Optional[Any]:
+        """Returns the newest message of a type only if it is recent enough.
+
+        Args:
+            msg_type: MAVLink message name, e.g. ``"GLOBAL_POSITION_INT"``.
+            max_age_s: Maximum age in seconds.
+
+        Returns:
+            The message, or None if none has been seen or it is older than ``max_age_s``.
+        """
+        msg, rx_time = self.latest_with_time(msg_type)
+        if msg is None or time.monotonic() - rx_time > max_age_s:
+            return None
+        return msg
 
     def age(self, msg_type: str) -> float:
         """Returns how long ago a message type was last received from the target autopilot.
@@ -551,7 +758,7 @@ class Link:
         return self._master.mode_mapping()
 
     def close(self) -> None:
-        """Stops the reader and heartbeat threads and closes the connection.
+        """Stops the reader, heartbeat and stream threads and closes the connection.
 
         Returns within about 1 s. Safe to call more than once.
         """
@@ -564,7 +771,7 @@ class Link:
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.stop()
         deadline = time.monotonic() + self._CLOSE_TIMEOUT_S
-        for thread in (self._reader_thread, self._heartbeat_thread):
+        for thread in (self._reader_thread, self._heartbeat_thread, self._stream_thread):
             if thread is None:
                 continue
             thread.join(timeout=max(0.0, deadline - time.monotonic()))

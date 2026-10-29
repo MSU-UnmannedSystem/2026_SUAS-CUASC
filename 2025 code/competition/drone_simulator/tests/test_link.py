@@ -1,4 +1,5 @@
 import collections
+import errno
 import logging
 import queue
 import threading
@@ -7,7 +8,8 @@ import time
 import pytest
 from pymavlink import mavutil
 
-from competition.drone_simulator.vehicle.link import Link, LinkConfig, LinkTimeoutError
+from competition.drone_simulator.vehicle.link import (
+    Link, LinkConfig, LinkStreamError, LinkTimeoutError)
 
 mavlink = mavutil.mavlink
 LINK_LOGGER = "competition.drone_simulator.vehicle.link"
@@ -34,8 +36,9 @@ def copter_heartbeat(sysid=1):
 class FakeMav:
     """Stands in for master.mav: records sends and detects overlapping calls."""
 
-    def __init__(self, send_delay=0.0):
+    def __init__(self, send_delay=0.0, on_send=None):
         self.send_delay = send_delay
+        self.on_send = on_send
         self.sent = []
         self.overlap_detected = False
         self._active = 0
@@ -53,6 +56,8 @@ class FakeMav:
         finally:
             with self._guard:
                 self._active -= 1
+        if self.on_send is not None:
+            self.on_send(name, args, kwargs)
 
     def heartbeat_send(self, *args, **kwargs):
         self._record("heartbeat_send", args, kwargs)
@@ -73,11 +78,12 @@ class FakeMaster:
     Tests push more messages with feed() and simulate a dead port with fail().
     """
 
-    def __init__(self, messages=(), repeat=None, repeat_interval=0.02, send_delay=0.0):
+    def __init__(self, messages=(), repeat=None, repeat_interval=0.02, send_delay=0.0,
+                 on_send=None):
         self.queue = collections.deque(messages)
         self.repeat = repeat
         self.repeat_interval = repeat_interval
-        self.mav = FakeMav(send_delay=send_delay)
+        self.mav = FakeMav(send_delay=send_delay, on_send=on_send)
         self.target_system = 0
         self.target_component = 0
         self.close_calls = 0
@@ -125,7 +131,11 @@ def factory_for(master):
 
 
 def connect(master, **config_kwargs):
+    """Connects with stream requests and silence detection off unless a test asks for them."""
     config_kwargs.setdefault("connect_timeout_s", 2.0)
+    config_kwargs.setdefault("stream_rates_hz", {})
+    config_kwargs.setdefault("required_streams", ())
+    config_kwargs.setdefault("silence_timeout_s", 10.0)
     config = LinkConfig(device="fake", **config_kwargs)
     return Link.connect(config, connection_factory=factory_for(master))
 
@@ -271,7 +281,8 @@ def test_heartbeat_thread_survives_send_errors(caplog):
         with connect(master, heartbeat_hz=50):
             time.sleep(0.3)
     assert master.mav.count("heartbeat_send") > 0
-    assert sum("heartbeat send failed" in r.getMessage() for r in caplog.records) == 3
+    # 3 failures 20 ms apart: logged once (rate-limited to 1/s), and the thread kept going.
+    assert sum("heartbeat send failed" in r.getMessage() for r in caplog.records) == 1
 
 
 # --- reader thread / cache / subscriptions ---------------------------------
@@ -421,7 +432,8 @@ def test_reconnects_with_backoff_after_link_error():
             raise OSError("No such file or directory: 'fake'")
         return second
 
-    config = LinkConfig(device="fake", connect_timeout_s=2.0)
+    config = LinkConfig(device="fake", connect_timeout_s=2.0, stream_rates_hz={},
+                        required_streams=())
     with Link.connect(config, connection_factory=factory) as link:
         first.feed(position(35.01))
         assert wait_until(lambda: link.latest("GLOBAL_POSITION_INT") is not None)
@@ -473,3 +485,238 @@ def test_close_stops_both_threads_quickly():
 def test_is_serial(device, serial):
     link = Link(FakeMaster(), LinkConfig(device=device))
     assert link.is_serial is serial
+
+
+# --- stream requests ----------------------------------------------------------
+
+SET_INTERVAL = mavlink.MAV_CMD_SET_MESSAGE_INTERVAL
+
+
+def interval_requests(master):
+    """(msg_id, interval_us) of every SET_MESSAGE_INTERVAL sent, in order."""
+    return [(int(args[4]), args[5]) for name, args, _ in list(master.mav.sent)
+            if name == "command_long_send" and args[2] == SET_INTERVAL]
+
+
+def autopilot(stream_types=("GLOBAL_POSITION_INT",), result=mavlink.MAV_RESULT_ACCEPTED,
+              ack=True):
+    """FakeMaster that ACKs SET_MESSAGE_INTERVAL and starts sending the named streams."""
+    holder = {}
+    samples = {
+        mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT: lambda: position(35.0),
+        mavlink.MAVLINK_MSG_ID_ATTITUDE: lambda: make_msg(1, 1, "attitude", 0, 0, 0, 0, 0, 0, 0),
+    }
+    wanted = {getattr(mavlink, "MAVLINK_MSG_ID_" + t) for t in stream_types}
+
+    def on_send(name, args, kwargs):
+        if name != "command_long_send" or args[2] != SET_INTERVAL:
+            return
+        master = holder["master"]
+        if ack:
+            master.feed(make_msg(1, 1, "command_ack", SET_INTERVAL, result))
+        msg_id = int(args[4])
+        if msg_id in wanted and msg_id in samples:
+            master.feed(samples[msg_id]())
+
+    holder["master"] = FakeMaster([copter_heartbeat()], on_send=on_send)
+    return holder["master"]
+
+
+def test_connect_requests_default_streams():
+    master = autopilot()
+    config = LinkConfig(device="fake", connect_timeout_s=2.0)
+    with Link.connect(config, connection_factory=factory_for(master)) as link:
+        assert link.latest("GLOBAL_POSITION_INT") is not None
+        assert link._stream_thread.is_alive()
+    expected = [(getattr(mavlink, "MAVLINK_MSG_ID_" + name), 1e6 / rate)
+                for name, rate in config.stream_rates_hz.items()]
+    assert interval_requests(master) == expected
+    assert (mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 100000.0) in expected
+    assert (mavlink.MAVLINK_MSG_ID_VFR_HUD, 250000.0) in expected
+
+
+def test_missing_required_stream_raises_and_closes():
+    master = autopilot(stream_types=())
+    start = time.monotonic()
+    with pytest.raises(LinkStreamError, match="GLOBAL_POSITION_INT"):
+        connect(master, stream_rates_hz={"GLOBAL_POSITION_INT": 10.0},
+                required_streams=("GLOBAL_POSITION_INT",))
+    assert time.monotonic() - start < 5.0
+    assert master.close_calls == 1
+
+
+def test_rejected_or_unacked_stream_request_is_logged(caplog, monkeypatch):
+    monkeypatch.setattr(Link, "_STREAM_ACK_TIMEOUT_S", 0.1)
+    for master, text in ((autopilot(result=mavlink.MAV_RESULT_FAILED), "rejected"),
+                         (autopilot(ack=False), "No ACK")):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=LINK_LOGGER):
+            with connect(master, stream_rates_hz={"GLOBAL_POSITION_INT": 10.0},
+                         required_streams=("GLOBAL_POSITION_INT",)):
+                pass
+        assert any(text in r.getMessage() and "GLOBAL_POSITION_INT" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_config_validates_streams():
+    with pytest.raises(ValueError, match="NOT_A_MESSAGE"):
+        LinkConfig(device="fake", stream_rates_hz={"NOT_A_MESSAGE": 1.0}, required_streams=())
+    with pytest.raises(ValueError):
+        LinkConfig(device="fake", stream_rates_hz={"ATTITUDE": 0.0}, required_streams=())
+    with pytest.raises(ValueError, match="VFR_HUD"):
+        LinkConfig(device="fake", stream_rates_hz={"ATTITUDE": 1.0}, required_streams=("VFR_HUD",))
+
+
+def test_keeper_rerequests_stale_stream_rate_limited(monkeypatch):
+    monkeypatch.setattr(Link, "_STREAM_CHECK_PERIOD_S", 0.05)
+    monkeypatch.setattr(Link, "_STREAM_STALE_MIN_S", 0.3)
+    monkeypatch.setattr(Link, "_STREAM_REREQUEST_MIN_S", 0.5)
+    monkeypatch.setattr(Link, "_HEARTBEAT_FRESH_S", 0.3)
+    master = autopilot(stream_types=("GLOBAL_POSITION_INT",))  # ATTITUDE never comes
+    attitude_id = mavlink.MAVLINK_MSG_ID_ATTITUDE
+    position_id = mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT
+    stop = threading.Event()
+
+    def vehicle():  # heartbeat + position keep flowing
+        while not stop.wait(0.05):
+            master.feed(copter_heartbeat(), position(35.0))
+
+    feeder = threading.Thread(target=vehicle, daemon=True)
+    feeder.start()
+    try:
+        with connect(master, stream_rates_hz={"GLOBAL_POSITION_INT": 10.0, "ATTITUDE": 10.0},
+                     required_streams=("GLOBAL_POSITION_INT",)):
+            time.sleep(2.0)
+            ids = [i for i, _ in interval_requests(master)]
+            attitude_rerequests = ids.count(attitude_id) - 1
+            assert 2 <= attitude_rerequests <= 4       # every >= 0.5 s, not every 0.05 s
+            assert ids.count(position_id) == 1          # fresh stream left alone
+
+            stop.set()                                  # autopilot goes silent
+            time.sleep(0.5)
+            before = len(interval_requests(master))
+            time.sleep(1.0)
+            assert len(interval_requests(master)) == before
+    finally:
+        stop.set()
+        feeder.join(1.0)
+
+
+# --- silence detection, TCP EOF, log rate limits -------------------------------
+
+
+def test_silence_marks_link_down_and_reopens(caplog):
+    first = FakeMaster([copter_heartbeat()])
+    second = FakeMaster()
+    masters = [first, second]
+
+    def factory(device, **kwargs):
+        return masters.pop(0) if masters else FakeMaster()
+
+    config = LinkConfig(device="fake", connect_timeout_s=2.0, stream_rates_hz={},
+                        required_streams=(), silence_timeout_s=0.5)
+    with caplog.at_level(logging.ERROR, logger=LINK_LOGGER):
+        with Link.connect(config, connection_factory=factory) as link:
+            assert link.is_up
+            assert wait_until(lambda: not link.is_up, timeout=1.5)   # 0.5 s of silence
+            assert any("silence" in r.getMessage() for r in caplog.records)
+            assert first.close_calls == 1
+            assert wait_until(lambda: link.is_up, timeout=2.0)       # reopened (second)
+            second.feed(copter_heartbeat())
+            assert wait_until(lambda: link.age("HEARTBEAT") < 0.2)
+
+
+def test_traffic_keeps_silence_timer_reset():
+    master = FakeMaster([copter_heartbeat()])
+    stop = threading.Event()
+
+    def vehicle():
+        while not stop.wait(0.1):
+            master.feed(copter_heartbeat())
+
+    t = threading.Thread(target=vehicle, daemon=True)
+    t.start()
+    try:
+        with connect(master, silence_timeout_s=0.5) as link:
+            time.sleep(1.5)
+            assert link.is_up
+            assert master.close_calls == 0
+    finally:
+        stop.set()
+        t.join(1.0)
+
+
+def test_other_systems_do_not_count_as_autopilot_traffic():
+    master = FakeMaster([copter_heartbeat()])
+    stop = threading.Event()
+
+    def gcs_only():
+        while not stop.wait(0.1):
+            master.feed(gcs_heartbeat())
+
+    t = threading.Thread(target=gcs_only, daemon=True)
+    t.start()
+    try:
+        with connect(master, silence_timeout_s=0.5) as link:
+            assert wait_until(lambda: not link.is_up, timeout=1.5)
+    finally:
+        stop.set()
+        t.join(1.0)
+
+
+class _ClosedSocket:
+    def __init__(self, error=None):
+        self.error = error
+
+    def recv(self, n):
+        if self.error is not None:
+            raise self.error
+        return b""  # peer closed
+
+    def close(self):
+        pass
+
+
+def make_tcp_master(sock):
+    tcp = object.__new__(mavutil.mavtcp)  # no real socket
+    tcp.port = sock
+    tcp.address = ("127.0.0.1", 5760)
+    tcp.autoreconnect = False
+    return tcp
+
+
+@pytest.mark.parametrize("sock", [
+    _ClosedSocket(),                                                    # EOF -> handle_eof
+    _ClosedSocket(ConnectionResetError(errno.ECONNRESET, "reset")),     # -> handle_disconnect
+])
+def test_tcp_peer_close_raises_instead_of_spinning(sock, capsys):
+    tcp = make_tcp_master(sock)
+    opened = Link._open(LinkConfig(device="tcp:127.0.0.1:5760"), lambda device, **kw: tcp)
+    assert opened is tcp
+    with pytest.raises(ConnectionResetError):
+        tcp.recv(16)
+    with pytest.raises(ConnectionResetError):
+        tcp.handle_eof()
+    with pytest.raises(ConnectionResetError):
+        tcp.handle_disconnect()
+    assert "EOF on TCP socket" not in capsys.readouterr().out
+
+
+def test_non_tcp_connections_are_not_patched():
+    master = FakeMaster()
+    Link._open(LinkConfig(device="fake"), lambda device, **kw: master)
+    assert "handle_eof" not in master.__dict__
+
+
+def test_heartbeat_failure_log_is_rate_limited(caplog):
+    master = FakeMaster([copter_heartbeat()])
+
+    def broken(*args, **kwargs):
+        raise OSError("port gone")
+
+    master.mav.heartbeat_send = broken
+    with caplog.at_level(logging.ERROR, logger=LINK_LOGGER):
+        with connect(master, heartbeat_hz=100):
+            time.sleep(1.5)  # ~150 failures
+    logged = sum("heartbeat send failed" in r.getMessage() for r in caplog.records)
+    assert 1 <= logged <= 2
