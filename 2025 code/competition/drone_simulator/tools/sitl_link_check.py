@@ -428,8 +428,8 @@ def check_reconnect(args: argparse.Namespace) -> int:
         max_age_down = 0.0
         max_cpu_down = 0.0
         was_up = True
-        fresh_after_recovery = False     # heartbeat < 2 s old at some point after an outage
-        position_resumed = False         # likewise GLOBAL_POSITION_INT (keeper re-requested it)
+        fresh_after_recovery = False     
+        position_resumed = False         
         last_cpu, last_wall = time.process_time(), time.monotonic()
         end = time.monotonic() + args.duration
         while time.monotonic() < end:
