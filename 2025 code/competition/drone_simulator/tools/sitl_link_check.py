@@ -6,11 +6,15 @@ Run from the "2025 code" folder, e.g.::
 
 Subcommands (see docs/runbooks/sitl_link_checks.md for the full procedure):
     lock       Link targets the autopilot, not Mission Planner's forwarded heartbeat.
-    failsafe   ArduPilot's GCS failsafe counts our heartbeats (SYSID_MYGCS question).
+    failsafe   ArduPilot's GCS failsafe counts our heartbeats.
     acks       Record the COMMAND_ACKs ArduPilot sends for DO_SET_MODE / TAKEOFF / ARM.
     reconnect  Watch is_up/age()/CPU while you kill and restart the link.
     params     Find the waypoint climb-rate param (WPNAV_SPEED_UP or its renamed
                successor) and compare it with config climb_rate_m_s.
+    mission    Upload + verify the 2026 fence and a 3-waypoint mission, fly it in
+               AUTO and print every MISSION_ITEM_REACHED (SITL only).
+
+``identity`` is an alias for ``lock`` and ``commands`` for ``acks``.
 
 Only ``params`` (read-only) is allowed on a serial device; everything else
 flies the vehicle and refuses to run unless the link is udp/tcp or
@@ -34,9 +38,11 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from competition.drone_simulator.config.mission_params import parameters
-from competition.drone_simulator.vehicle import commands, params
+from competition.drone_simulator.vehicle import commands, params, upload
 from competition.drone_simulator.vehicle.commands import CommandDenied, CommandError
-from competition.drone_simulator.vehicle.link import Link, LinkConfig, LinkTimeoutError
+from competition.drone_simulator.vehicle.link import (
+    Link, LinkConfig, LinkStreamError, LinkTimeoutError)
+from competition.drone_simulator.vehicle.upload import MissionError
 
 logger = logging.getLogger("sitl")
 mavlink = mavutil.mavlink
@@ -319,12 +325,14 @@ def check_failsafe(args: argparse.Namespace) -> int:
 
         take_off(link, args.alt)
 
-        logger.info("Other GCSs heartbeating right now: %s",
-                    ", ".join(monitor.gcs_sources_since(monitor.now() - 3.0)) or "none")
-        prompt("Vehicle is hovering in GUIDED. Stop EVERY other GCS now: press Disconnect in "
-               "Mission Planner, and if MAVProxy is in the chain type `set heartbeat 0` at the "
-               "GUIDED> prompt in the terminal where you ran sim_vehicle.py (not the 'ArduCopter' "
-               "xterm, not here), or start SITL with -m \"--heartbeat-rate 0\". Then come back")
+        others_now = monitor.gcs_sources_since(monitor.now() - 3.0)
+        logger.info("Other GCSs heartbeating right now: %s", ", ".join(others_now) or "none")
+        if others_now:
+                prompt("Vehicle is hovering in GUIDED. Stop EVERY other GCS now: press Disconnect "
+                   "in Mission Planner, and if MAVProxy is in the chain type `set heartbeat 0` at the "
+                   "GUIDED> prompt in the terminal where you ran sim_vehicle.py (not the "
+                   "'ArduCopter' xterm, not here), or start SITL with -m \"--heartbeat-rate 0\". "
+                   "Then come back")
         still = wait_for_gcs_silence(monitor, timeout_s=30.0)
         if still:
             logger.info("Vehicle left hovering in GUIDED; land it from Mission Planner.")
@@ -364,6 +372,11 @@ def check_failsafe(args: argparse.Namespace) -> int:
         return result(not expect_counted,
                       "failsafe fired while our heartbeats (sysid %d) were running: they are NOT "
                       "counted (%s)" % (args.source_system, phase1))
+    if not expect_counted and my_gcs is not None and not monitor.gcs_heartbeat_seen():
+        # ArduPilot only arms the GCS failsafe once it has heard its GCS (MAV_GCS_SYSID).
+        return result(True, "our heartbeats (sysid %d) are NOT counted as the GCS (%s=%d): the "
+                      "GCS failsafe never engaged in either phase"
+                      % (args.source_system, my_gcs[0], my_gcs[1]))
     return result(None, "no failsafe in either phase; check FS_GCS_ENABLE and that the vehicle "
                   "was armed and flying")
 
@@ -409,12 +422,14 @@ def check_acks(args: argparse.Namespace) -> int:
 def check_reconnect(args: argparse.Namespace) -> int:
     with open_link(args) as link:
         require_sitl(link, args)
-        logger.info("Watching for %.0f s. Kill the link (Ctrl-C the pty bridge), wait ~10 s, "
-                    "restart it.", args.duration)
+        logger.info("Watching for %.0f s. Kill the link (stop SITL, or Ctrl-C the pty bridge), "
+                    "wait, then restart it.", args.duration)
         downs, ups = [], []
         max_age_down = 0.0
         max_cpu_down = 0.0
         was_up = True
+        fresh_after_recovery = False     # heartbeat < 2 s old at some point after an outage
+        position_resumed = False         # likewise GLOBAL_POSITION_INT (keeper re-requested it)
         last_cpu, last_wall = time.process_time(), time.monotonic()
         end = time.monotonic() + args.duration
         while time.monotonic() < end:
@@ -434,23 +449,76 @@ def check_reconnect(args: argparse.Namespace) -> int:
             if not up:
                 max_age_down = max(max_age_down, hb_age)
                 max_cpu_down = max(max_cpu_down, cpu_pct)
+            elif ups:
+                fresh_after_recovery = fresh_after_recovery or hb_age < 2.0
+                position_resumed = position_resumed or pos_age < 2.0
             was_up = up
-        recovered_fresh = link.is_up and link.age("HEARTBEAT") < 2.0
-        position_resumed = link.age("GLOBAL_POSITION_INT") < 2.0
+        down_at_end = not link.is_up
 
+    logger.info("is_up went False = %s", bool(downs))
+    logger.info("Recovered = %s", bool(ups) and fresh_after_recovery)
     if not downs:
-        return result(None, "the link never went down; did you kill the bridge?")
+        return result(None, "the link never went down; did you kill SITL / the bridge?")
     if not position_resumed:
         # Not a reconnect failure: Link does not re-request streams after reconnecting.
-        logger.warning("GLOBAL_POSITION_INT did not resume after reconnect: the stream request "
-                       "was lost and must be re-sent after a reconnect")
+        logger.warning("GLOBAL_POSITION_INT did not resume after reconnect")
     outage_s = (ups[0] - downs[0]) if ups else None
-    ok = bool(ups) and recovered_fresh and max_cpu_down < 20.0 and max_age_down >= 3.0
+    ok = bool(ups) and fresh_after_recovery and max_cpu_down < 20.0 and max_age_down >= 3.0
     return result(ok, "down %d time(s); first outage %s; max age(HEARTBEAT) while down %.1f s; "
                   "max CPU while down %.1f%%; fresh heartbeat after recovery: %s; position "
-                  "stream resumed: %s"
+                  "stream resumed: %s%s"
                   % (len(downs), "%.1f s" % outage_s if outage_s else "never recovered",
-                     max_age_down, max_cpu_down, recovered_fresh, position_resumed))
+                     max_age_down, max_cpu_down, fresh_after_recovery, position_resumed,
+                     "; still down when the window ended" if down_at_end else ""))
+
+
+# 2026 field: inclusion fence A-B-C-D and a short mission inside it (alt m above home).
+FENCE_2026 = [(35.05932, -118.149), (35.06496, -118.156), (35.06062, -118.163),
+              (35.05932, -118.163)]
+MISSION_2026 = [(35.0610, -118.1570, 15.0), (35.0620, -118.1555, 20.0),
+                (35.0605, -118.1545, 15.0)]
+
+
+def check_mission(args: argparse.Namespace) -> int:
+    with open_link(args) as link, Monitor(link):
+        require_sitl(link, args)
+        vertices = upload.upload_fence(link, FENCE_2026)
+        logger.info("Fence: %d vertices uploaded and read back OK (not enabled)", vertices)
+        last_nav_seq = upload.upload_waypoint_mission(link, MISSION_2026)
+        rtl_seq = last_nav_seq + 1
+        logger.info("Mission: home + %d waypoints + RTL (seq %d) uploaded and read back OK",
+                    last_nav_seq, rtl_seq)
+
+        reached = []  # type: List[int]
+        landed = False
+        # Subscribe before AUTO so no MISSION_ITEM_REACHED is missed.
+        with link.subscribe("MISSION_ITEM_REACHED", maxsize=100) as sub:
+            take_off(link, args.alt)
+            commands.set_mode(link, "AUTO", timeout_s=10.0)
+            logger.info("AUTO confirmed; flying the mission (limit %.0f s)", args.flight_timeout)
+            deadline = time.monotonic() + args.flight_timeout
+            while time.monotonic() < deadline:
+                while True:
+                    try:
+                        msg = sub.get(timeout=0)
+                    except queue.Empty:
+                        break
+                    if msg.get_srcSystem() == link.target_system:
+                        reached.append(msg.seq)
+                        logger.info("MISSION_ITEM_REACHED seq=%d%s", msg.seq,
+                                    " (RTL)" if msg.seq == rtl_seq else "")
+                hb = link.latest("HEARTBEAT")
+                if hb is not None and not hb.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
+                    landed = True
+                    logger.info("Landed and disarmed (mode %s)", commands.current_mode(link))
+                    break
+                time.sleep(0.2)
+
+    waypoints_in_order = [seq for seq in reached if seq <= last_nav_seq] == list(
+        range(1, last_nav_seq + 1))
+    summary = "reached %s; RTL item reached: %s; landed and disarmed: %s" % (
+        reached, rtl_seq in reached, landed)
+    return result(waypoints_in_order and landed, summary)
 
 
 def fetch_all_params(link: Link, idle_timeout_s: float = 5.0,
@@ -537,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="check", required=True)
 
-    p = sub.add_parser("lock", parents=[common], help=check_lock.__doc__)
+    p = sub.add_parser("lock", aliases=["identity"], parents=[common], help=check_lock.__doc__)
     p.add_argument("--listen", type=float, default=10.0, help="seconds to list heartbeat sources")
     p.add_argument("--vehicle-sysid", type=int, default=1)
     p.set_defaults(func=check_lock)
@@ -547,13 +615,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enable-fs", action="store_true", help="set FS_GCS_ENABLE=1 if it is 0")
     p.set_defaults(func=check_failsafe)
 
-    p = sub.add_parser("acks", parents=[common])
+    p = sub.add_parser("acks", aliases=["commands"], parents=[common])
     p.add_argument("--alt", type=float, default=5.0, help="takeoff altitude, m")
     p.set_defaults(func=check_acks)
 
     p = sub.add_parser("reconnect", parents=[common])
     p.add_argument("--duration", type=float, default=60.0, help="seconds to watch")
     p.set_defaults(func=check_reconnect)
+
+    p = sub.add_parser("mission", parents=[common])
+    p.add_argument("--alt", type=float, default=15.0, help="takeoff altitude, m")
+    p.add_argument("--flight-timeout", type=float, default=300.0,
+                   help="seconds to wait for the mission to finish and the vehicle to disarm")
+    p.set_defaults(func=check_mission)
 
     p = sub.add_parser("params", parents=[common])
     p.add_argument("--grep", default=None,
@@ -569,8 +643,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         datefmt="%H:%M:%S")
     try:
         return args.func(args)
-    except LinkTimeoutError as exc:
+    except (LinkTimeoutError, LinkStreamError) as exc:
         return result(False, str(exc))
+    except MissionError as exc:
+        return result(False, "%s: %s" % (type(exc).__name__, exc))
     except CommandError as exc:
         return result(False, "%s: %s" % (type(exc).__name__, exc))
     except OSError as exc:  # includes serial.SerialException

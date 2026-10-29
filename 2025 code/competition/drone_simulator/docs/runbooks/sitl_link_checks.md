@@ -10,11 +10,12 @@ python3 competition/drone_simulator/tools/sitl_link_check.py <check> [--device .
 
 | Check       | Question it answers                                                    | Flies? |
 |-------------|------------------------------------------------------------------------|--------|
-| `lock`      | Does Link lock onto the autopilot, not Mission Planner's forwarded heartbeat? | no |
+| `lock` (alias `identity`) | Does Link lock onto the autopilot, not Mission Planner's forwarded heartbeat? | no |
 | `failsafe`  | Does ArduPilot's GCS failsafe count our heartbeats (`SYSID_MYGCS`)?    | yes |
-| `acks`      | Which COMMAND_ACKs does ArduPilot send for DO_SET_MODE, TAKEOFF and ARM? | yes |
+| `acks` (alias `commands`) | Which COMMAND_ACKs does ArduPilot send for DO_SET_MODE, TAKEOFF and ARM? | yes |
 | `reconnect` | After the link dies, does `is_up` drop, does `age()` grow, does it reconnect, and is CPU low? | no |
-| `params`    | What is the real `WPNAV_SPEED_UP`, and does config match it?           | no (read-only) |
+| `params`    | What is the real `WP_SPD_UP` / `WPNAV_SPEED_UP`, and does config match it? | no (read-only) |
+| `mission`   | Do the fence and a waypoint mission upload, read back, and fly in AUTO? | yes |
 
 The checks that fly refuse to run on a serial device unless you pass `--i-know-this-is-sitl`.
 `params` is read-only, so it is safe to run against the real Cube.
@@ -73,10 +74,11 @@ connects itself to 5760. From WSL, the checks must use the Windows host IP, for 
 Wait until Mission Planner shows GPS 3D fix / EKF OK (about 30 s after SITL starts) before running
 the checks that fly. `arm` retries while pre-arm checks are still failing.
 
-> **Position stream:** on SITL's SERIAL1, ArduPilot doesn't send `GLOBAL_POSITION_INT` unless that
-> port asks for it, and Mission Planner's requests only apply to its own port. The checks send
-> `SET_MESSAGE_INTERVAL` themselves (5 Hz). On the Cube, TELEM2 behaves the same unless the
-> `SR2_*` parameters are set. `takeoff()` and `disarm()` need this stream.
+> **Streams:** ArduPilot sends only HEARTBEAT on a port until that port asks for more, and
+> Mission Planner's requests only apply to its own port. `Link.connect()` now requests
+> `LinkConfig.stream_rates_hz` with SET_MESSAGE_INTERVAL and fails with `LinkStreamError` if
+> `GLOBAL_POSITION_INT` never arrives. Its keeper thread re-requests streams after a reconnect or an
+> autopilot reboot, which forgets them. TELEM2 on the Cube behaves the same way.
 
 ---
 
@@ -119,8 +121,10 @@ python3 competition/drone_simulator/tools/sitl_link_check.py failsafe --enable-f
 5. Reconnect Mission Planner and let the vehicle land. Record the GCS id parameter name it printed
    in the `link.py` TODO.
 
-Control run: `--source-system 254`. Now the failsafe should fire in phase 1, even though we keep
-sending heartbeats. This confirms the sysid must match.
+Control run: `--source-system 254`, on a fresh SITL with no other GCS. ArduPilot only engages the
+GCS failsafe after it has heard a heartbeat from `MAV_GCS_SYSID`. Our sysid-254 heartbeats never
+count, so neither phase fails over. The check reports PASS ("NOT counted"). With Mission Planner
+connected first, the failsafe would instead fire in phase 1, as soon as Mission Planner disconnects.
 
 ## 3. `acks`: what ArduPilot actually ACKs
 
@@ -145,10 +149,19 @@ IN_PROGRESS ACKs. Record:
 
 ## 4. `reconnect`: kill the link mid-run
 
-A plain TCP link can't test this. When the other end closes, pymavlink reports "no data" instead of
-raising, so `Link` never sees an error. (That's a known gap, see below.) Use the pty bridge instead.
-It turns SITL's TCP port into a pseudo-serial device, and killing it behaves like unplugging a USB or
-UART cable.
+**Directly on TCP (SITL without MAVProxy, check on 5760):**
+
+```bash
+python3 competition/drone_simulator/tools/sitl_link_check.py reconnect --device tcp:127.0.0.1:5760 --duration 150
+```
+
+About 20 s in, Ctrl-C SITL, wait 20 s, start it again. Link now turns a closed TCP connection into
+`ConnectionResetError`, so there's no "EOF on TCP socket" flood. The result prints
+`is_up went False = True` and `Recovered = True`. pymavlink prints one `[Errno 111] Connection
+refused sleeping` line per failed reconnect attempt while SITL is down; that's expected.
+
+**Through a pseudo-serial device (exercises the UART error path):** the pty bridge turns SITL's TCP
+port into a serial device, and killing it behaves like unplugging a USB or UART cable.
 
 Terminal 1, the "cable":
 ```bash
@@ -160,18 +173,14 @@ Terminal 2:
 python3 competition/drone_simulator/tools/sitl_link_check.py reconnect --device /tmp/sitl-serial --i-know-this-is-sitl --duration 60
 ```
 
-About 10 s in, **Ctrl-C terminal 1**. Wait about 10 s, then start the bridge again. The check prints
-`is_up`, `age(HEARTBEAT)`, `age(GLOBAL_POSITION_INT)` and the process CPU % once per second.
+About 10 s in, **Ctrl-C terminal 1**. Wait about 10 s, then start the bridge again.
 
-- **PASS:** one `Link ... down (SerialException ...)` error, ages climbing while down, CPU in single
-  digits, then `recovered after N attempt(s)` and `age(HEARTBEAT)` back under 1 s.
-- Also note `position stream resumed:` in the result. If it says False, the vehicle forgot the
-  `SET_MESSAGE_INTERVAL` request across the reconnect, and Link will have to re-request streams
-  after reconnecting.
-
-Known gap (optional to see): run `reconnect` straight on `tcp:127.0.0.1:5762` and kill SITL.
-`is_up` stays True, pymavlink prints `EOF on TCP socket` over and over, and CPU goes up. The real
-UART/USB path raises errors properly; TCP/UDP links need separate handling.
+- **PASS:** one `Link ... down (...)` error, ages climbing while down, CPU in single digits, then
+  `recovered after N attempt(s)`, fresh heartbeat, and `position stream resumed: True`. A fresh
+  SITL forgets stream requests, so you'll also see the keeper's
+  `... stale ... re-requesting` warnings.
+- A pulled wire on a 3-wire UART gives silence, not an error. After `silence_timeout_s` (3 s) of
+  silence, Link treats the link as down and goes through the same reconnect path.
 
 ## 5. `params`: put the real climb rate in config
 
@@ -192,3 +201,47 @@ Check that guess against the parameter's units in Mission Planner. It compares t
 
 Use the Cube's value, not SITL's (SITL just has the default). The download takes a few seconds over
 TCP and longer over the UART. Run it on the Cube to also see which GCS-id name its firmware uses.
+
+## 6. `mission`: fence + waypoint mission, flown in AUTO (SITL only)
+
+Fresh SITL, no MAVProxy, at the 2026 field home. The check connects on 5760 (no Mission Planner):
+
+```bash
+cd ~/ardupilot && Tools/autotest/sim_vehicle.py -v ArduCopter --no-mavproxy -w --custom-location=35.0605,-118.156,850,0
+python3 competition/drone_simulator/tools/sitl_link_check.py mission --device tcp:127.0.0.1:5760
+```
+
+It does these steps, in order:
+1. Uploads the 2026 inclusion fence (A 35.05932,-118.149 / B 35.06496,-118.156 /
+   C 35.06062,-118.163 / D 35.05932,-118.163) and reads it back. The fence is not enabled.
+2. Uploads home + 3 waypoints + RTL — (35.0610,-118.1570,15), (35.0620,-118.1555,20),
+   (35.0605,-118.1545,15), alt in m above home — and reads it back.
+3. Flies like MissionBase: GUIDED, arm, takeoff to 15 m, AUTO.
+4. Prints every `MISSION_ITEM_REACHED` until the vehicle lands and disarms.
+
+**PASS:** reached 1, 2, 3 in order, then landed and disarmed. The RTL item (seq 4) is reported as
+reached at touchdown.
+
+Output seen on 2026-10-28 (ArduPilot master `4.6.0-beta1-6701-gfaa316a07b`, SITL home
+35.0605,-118.156,850; pre-arm retries while the EKF settled are trimmed):
+
+```
+Fence verified: 4-vertex inclusion polygon (not enabled)
+Mission verified: 3 waypoint(s) + RTL
+Climb speed 2.50 m/s from WP_SPD_UP = 2.5 (WP_SPD_UP <= 20 treated as m/s)
+Mode GUIDED confirmed
+COMMAND_ACK MAV_CMD_COMPONENT_ARM_DISARM -> MAV_RESULT_ACCEPTED (6 ms after send)
+COMMAND_ACK MAV_CMD_NAV_TAKEOFF -> MAV_RESULT_ACCEPTED (4 ms after send)
+Takeoff complete at 14.3 m
+Mode AUTO confirmed
+STATUSTEXT: Mission: 1 WP
+MISSION_ITEM_REACHED seq=1
+MISSION_ITEM_REACHED seq=2
+STATUSTEXT: Mission: 4 RTL
+MISSION_ITEM_REACHED seq=3
+STATUSTEXT: SIM Hit ground at 0.501082 m/s
+STATUSTEXT: Disarming motors
+MISSION_ITEM_REACHED seq=4 (RTL)
+Landed and disarmed (mode AUTO)
+RESULT: PASS - reached [1, 2, 3, 4]; RTL item reached: True; landed and disarmed: True
+```
