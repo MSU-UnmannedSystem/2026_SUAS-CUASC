@@ -1,0 +1,4 @@
+# Run logs are written here (see flight_log.py). Keep them out of git;
+# copy the ones worth keeping somewhere else.
+*
+!.gitignore

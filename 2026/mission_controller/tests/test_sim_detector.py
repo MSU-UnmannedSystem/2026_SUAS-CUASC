@@ -58,12 +58,12 @@ def test_hide_after_simulates_lost_lock():
     assert det.detect() is None
 
 
-def test_sim_target_refused_on_serial(monkeypatch):
+def test_sim_target_refused_on_serial(monkeypatch, tmp_path):
     link = FakeLink(device="/dev/ttyTHS1")
     link.closed = False
     link.close = lambda: setattr(link, "closed", True)
     monkeypatch.setattr(run_flight.Link, "connect", staticmethod(lambda config: link))
-    assert run_flight.main(["--sim-target", "35.061,-118.157"]) == 1
+    assert run_flight.main(["--sim-target", "35.061,-118.157", "--log-dir", str(tmp_path)]) == 1
     assert link.closed
     assert link.calls == []
 
