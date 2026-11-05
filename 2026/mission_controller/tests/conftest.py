@@ -32,3 +32,10 @@ def background():
     stop.set()
     for t in threads:
         t.join(timeout=1)
+
+
+@pytest.fixture(autouse=True)
+def _logs_in_tmp(tmp_path, monkeypatch):
+    """No test writes into the real mission_controller/logs folder."""
+    from mission_controller import flight_log
+    monkeypatch.setattr(flight_log, "DEFAULT_LOG_DIR", str(tmp_path / "logs"))

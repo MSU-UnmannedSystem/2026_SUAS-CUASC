@@ -1,6 +1,7 @@
 """Flight-time settings for the Jetson handover (one target / one payload per flight)."""
 
 from dataclasses import dataclass
+from typing import Union
 
 
 @dataclass
@@ -38,8 +39,16 @@ class HandoverConfig:
             velocity), in seconds. TUNE.
         camera_hfov_deg: Horizontal field of view in degrees. From main.py: 65.0.
         camera_vfov_deg: Vertical field of view in degrees. From main.py: 39.4.
-        camera_index: OpenCV camera index.
+        camera_index: OpenCV camera index (0 = /dev/video0) or a device path.
+        camera_width_px: Capture width to request. The FOV above is for 1920x1080.
+        camera_height_px: Capture height to request.
+        camera_fourcc: Capture pixel format to request; MJPG lets 1080p run at full
+            rate over USB 2.
+        camera_startup_timeout_s: run_flight refuses to start if the camera gives no
+            frame within this many seconds.
         target_type: Detector mode in the copied VisionPipeline ('red_bullseye').
+        fc_serial_port: The Cube SERIALn port the Jetson is wired to (TELEM2 = 2).
+            Only used to read and report that port's settings before flight.
     """
 
     device: str = "/dev/ttyTHS1"
@@ -62,13 +71,20 @@ class HandoverConfig:
 
     camera_hfov_deg: float = 65.0
     camera_vfov_deg: float = 39.4
-    camera_index: int = 0
+    camera_index: Union[int, str] = 0
+    camera_width_px: int = 1920
+    camera_height_px: int = 1080
+    camera_fourcc: str = "MJPG"
+    camera_startup_timeout_s: float = 5.0
     target_type: str = "red_bullseye"
+
+    fc_serial_port: int = 2
 
     def __post_init__(self) -> None:
         positive = ("drop_alt_m", "drop_alt_tolerance_m", "max_horizontal_speed_m_s",
                     "horizontal_gain_per_s", "center_tolerance_m", "lost_lock_timeout_s",
-                    "command_rate_hz", "detection_max_age_s", "telemetry_max_age_s")
+                    "command_rate_hz", "detection_max_age_s", "telemetry_max_age_s",
+                    "camera_width_px", "camera_height_px", "camera_startup_timeout_s")
         for name in positive:
             if getattr(self, name) <= 0:
                 raise ValueError("%s must be > 0" % name)

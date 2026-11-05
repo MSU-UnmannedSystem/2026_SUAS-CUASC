@@ -3,30 +3,69 @@
 Detection code (_find_red_bullseye, _find_bw_square) is unchanged. Changes for
 flight use: it implements TargetDetector, records when each frame was captured
 (so a frozen camera reads as "no target" instead of a stale target), reports
-the real frame size (the capture resolution is not set, so it is whatever the
-camera defaults to), logs instead of printing, and close() is idempotent.
+the real frame size, logs instead of printing, and close() is idempotent.
+
+Capture settings: the 65 x 39.4 deg FOV used by guidance is the ELP
+USB12MP02AF at 1920x1080 (16:9). Left to itself, OpenCV may open the camera
+at a different size (often 640x480, 4:3), where that FOV is wrong. So the
+pipeline asks for a size and pixel format (MJPG, so 1080p runs at full rate
+over USB 2), logs what the camera actually gave, and wait_for_frame() lets
+run_flight refuse to fly without a working camera.
 """
 
 import logging
+import sys
 import cv2
 import numpy as np
 import math
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 from mission_controller.vision.detector import Detection, TargetDetector
 
 logger = logging.getLogger(__name__)
 
+_READ_FAIL_LOG_S = 5.0  # at most one "camera read failing" warning per this many seconds
+
+
 class VisionPipeline(TargetDetector):
-    def __init__(self, camera_index=0, target_type='red_bullseye'):
-        self.cap = cv2.VideoCapture(camera_index)
+    def __init__(self, camera_index: Union[int, str] = 0, target_type='red_bullseye',
+                 width: Optional[int] = None, height: Optional[int] = None,
+                 fourcc: Optional[str] = None):
+        """Opens the camera and starts the capture thread.
+
+        Args:
+            camera_index: OpenCV index (0 = /dev/video0) or a device path.
+            target_type: 'red_bullseye' or 'bw_square'.
+            width: Requested frame width (None = camera default).
+            height: Requested frame height (None = camera default).
+            fourcc: Requested pixel format, e.g. 'MJPG' (None = camera default).
+        """
+        if sys.platform.startswith("linux"):
+            self.cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+        else:
+            self.cap = cv2.VideoCapture(camera_index)
         self.target_type = target_type
         
         if not self.cap.isOpened():
-            logger.error("[VISION] Error: Could not open webcam.")
-            
+            logger.error("[VISION] Error: Could not open camera %r.", camera_index)
+        else:
+            # V4L2 wants the pixel format before the size.
+            if fourcc:
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+            if width:
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            if height:
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            logger.info("[VISION] Camera %r: asked for %sx%s %s, driver reports %dx%d @ %.0f fps",
+                        camera_index, width or "default", height or "default", fourcc or "",
+                        int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                        int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                        self.cap.get(cv2.CAP_PROP_FPS))
+
+        self.read_failures = 0
+        self._last_fail_log = float("-inf")
         self.ret = False
         self.frame = None
         self.frame_time = None  # time.monotonic() when self.frame was captured
@@ -48,6 +87,13 @@ class VisionPipeline(TargetDetector):
                     self.frame = frame
                     if ret:
                         self.frame_time = time.monotonic()
+                if not ret:
+                    self.read_failures += 1
+                    now = time.monotonic()
+                    if now - self._last_fail_log > _READ_FAIL_LOG_S:
+                        logger.warning("[VISION] Camera read failing (%d failed reads so far); "
+                                       "guidance sees no target", self.read_failures)
+                        self._last_fail_log = now
             # FIX: Prevent thread starvation / CPU pegging on the Jetson
             time.sleep(0.01)
 
@@ -65,6 +111,18 @@ class VisionPipeline(TargetDetector):
             return self._find_bw_square(frame)
             
         return None, None
+
+    def wait_for_frame(self, timeout_s: float) -> Optional[Tuple[int, int]]:
+        """Waits for the first captured frame. Returns its (width, height), or None."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self.lock:
+                if self.ret and self.frame is not None:
+                    height, width = self.frame.shape[:2]
+                    return width, height
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
 
     def detect(self) -> Optional[Detection]:
         """TargetDetector API: the target in the newest frame, with frame size and capture time."""

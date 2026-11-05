@@ -39,3 +39,23 @@ def test_no_target_and_no_frame():
     vp = pipeline_with_frame(None)
     vp.ret = False
     assert vp.detect() is None
+
+
+def test_wait_for_frame_reports_the_real_size():
+    vp = pipeline_with_frame(np.zeros((1080, 1920, 3), np.uint8))
+    assert vp.wait_for_frame(0.1) == (1920, 1080)
+    vp.frame, vp.ret = None, False
+    start = time.monotonic()
+    assert vp.wait_for_frame(0.2) is None
+    assert time.monotonic() - start >= 0.2
+
+
+def test_missing_camera_gives_no_frame_and_closes_cleanly():
+    vp = VisionPipeline(camera_index="/dev/video-does-not-exist", width=1920, height=1080,
+                        fourcc="MJPG")
+    try:
+        assert vp.wait_for_frame(0.3) is None
+        assert vp.detect() is None
+    finally:
+        vp.close()
+    vp.close()  # idempotent

@@ -1,0 +1,4 @@
+# Jetson (JetPack 6.2.1, Python 3.10). OpenCV: see README "Jetson setup".
+pymavlink>=2.4.40
+pyserial>=3.5
+pytest>=7

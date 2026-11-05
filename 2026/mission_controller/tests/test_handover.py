@@ -227,3 +227,94 @@ def test_wait_warns_when_mission_is_past_the_handover(background, caplog):
     with caplog.at_level("WARNING"):
         assert not controller.wait_for_handover(poll_s=0.02, timeout_s=0.3)
     assert any("past NAV_GUIDED_ENABLE" in r.getMessage() for r in caplog.records)
+
+
+# --- per-tick trace --------------------------------------------------------------------
+
+
+def test_trace_records_every_tick_through_to_the_lock(vehicle):
+    rows = []
+    config = HandoverConfig(**FAST)
+    controller = HandoverController(vehicle.link, SimDetector(vehicle), PLAN, config,
+                                    trace=rows.append)
+    assert controller.run() == handover.LOCKED
+    assert all(set(r) == set(handover.TRACE_FIELDS) for r in rows)
+    phases = [r["phase"] for r in rows]
+    assert phases[0] == "ALIGN" and phases[-1] == handover.LOCKED
+    assert "CENTRED" in phases
+    align = rows[0]
+    assert align["sent"] == 1 and align["frame_w_px"] == 640
+    assert align["offset_m"] > 0.5 and align["cmd_fwd_m_s"] > 0    # target is ahead
+    assert align["alt_m"] == pytest.approx(7.62)
+    sent_rows = [r for r in rows if r["sent"]]
+    # one row per guidance setpoint, plus the zero "stop" the hand-back sends
+    assert len(sent_rows) + 1 == len(vehicle.setpoints)
+
+
+def test_trace_records_search_while_target_is_lost(vehicle):
+    rows = []
+    controller = HandoverController(vehicle.link, SimDetector(vehicle),
+                                    PLAN, HandoverConfig(**dict(FAST, lost_lock_timeout_s=0.3)),
+                                    trace=rows.append)
+    controller.detector.visible = False
+    assert controller.run() == handover.GAVE_UP
+    assert {r["phase"] for r in rows[:-1]} == {"SEARCH"}
+    assert rows[-1]["phase"] == handover.GAVE_UP and rows[-1]["lost_for_s"] >= 0.3
+
+
+def test_broken_trace_never_stops_guidance(vehicle, caplog):
+    def broken(row):
+        raise IOError("disk full")
+    controller = HandoverController(vehicle.link, SimDetector(vehicle), PLAN,
+                                    HandoverConfig(**FAST), trace=broken)
+    with caplog.at_level("ERROR"):
+        assert controller.run() == handover.LOCKED
+    assert vehicle.servos == {7: 1900}
+    assert sum("trace failed" in r.getMessage() for r in caplog.records) == 1
+
+
+# --- bench mode --------------------------------------------------------------------------
+
+
+def bench_vehicle(background, **kw):
+    sim = NavGuidedVehicle(FakeLink(), guided_seq=PLAN.guided_seq, start_seq=0, **kw)
+    sim.mode = "STABILIZE"        # on the bench: not AUTO, not on the handover item
+    sim.armed = False
+    background(sim.tick, period_s=0.01)
+    time.sleep(0.03)
+    return sim
+
+
+@pytest.mark.parametrize("plan", [PLAN, None])
+def test_bench_runs_guidance_but_sends_nothing(background, plan):
+    sim = bench_vehicle(background, target_north_m=0.2, target_east_m=0.1)
+    rows = []
+    controller = HandoverController(sim.link, SimDetector(sim), plan, HandoverConfig(**FAST),
+                                    trace=rows.append, bench_alt_m=7.62)
+    assert controller.run() == handover.LOCKED      # would lock: target is within 0.5 m
+    assert sim.link.calls == []                      # no setpoints, no hand-back, nothing
+    assert sim.servos == {} and sim.seq == 0
+    assert rows and all(r["sent"] == 0 for r in rows)
+
+
+def test_bench_uses_the_bench_height(background):
+    sim = bench_vehicle(background, target_north_m=2.0, target_east_m=0.0)
+    rows = []
+    controller = HandoverController(sim.link, SimDetector(sim), PLAN,
+                                    HandoverConfig(**dict(FAST, lost_lock_timeout_s=0.2)),
+                                    trace=rows.append, bench_alt_m=1.5)
+    threading.Timer(0.2, lambda: setattr(controller.detector, "visible", False)).start()
+    assert controller.run() == handover.GAVE_UP
+    assert rows[0]["alt_m"] == 1.5
+    # SimDetector draws the target as seen from 7.62 m, so at 1.5 m the same pixel is
+    # 1.5 / 7.62 as far away: 2.0 m * 0.197 = 0.39 m ahead.
+    assert rows[0]["fwd_m"] == pytest.approx(2.0 * 1.5 / 7.62, abs=0.01)
+    assert sim.link.calls == []
+
+
+def test_bench_needs_a_positive_height_and_flight_needs_a_plan(vehicle):
+    with pytest.raises(ValueError):
+        HandoverController(vehicle.link, SimDetector(vehicle), PLAN, HandoverConfig(),
+                           bench_alt_m=0.0)
+    with pytest.raises(ValueError):
+        HandoverController(vehicle.link, SimDetector(vehicle), None, HandoverConfig())

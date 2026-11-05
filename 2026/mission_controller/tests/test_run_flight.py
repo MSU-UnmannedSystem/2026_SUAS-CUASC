@@ -135,3 +135,188 @@ def test_never_uploads_or_commands_flight():
     for word in ("mission_count_send", "mission_item_int_send", "MAV_CMD_COMPONENT_ARM_DISARM",
                  "MAV_CMD_NAV_TAKEOFF", "MAV_CMD_DO_SET_MODE"):
         assert word not in text
+
+
+# --- whole runs through main(): log files, FC setup report, camera, bench ----------
+
+import csv  # noqa: E402
+import glob  # noqa: E402
+import os  # noqa: E402
+import threading  # noqa: E402
+
+from mission_controller.vision.detector import Detection  # noqa: E402
+
+GOOD_FC_PARAMS = {"SERIAL2_PROTOCOL": 2, "SERIAL2_BAUD": 921, "BRD_SER2_RTSCTS": 0,
+                  "SERIAL2_OPTIONS": 0, "SYSID_MYGCS": 255, "GUID_TIMEOUT": 3,
+                  "FS_GCS_ENABLE": 0, "FS_GCS_TIMEOUT": 5}
+FAST = dict(max_horizontal_speed_m_s=2.0, horizontal_gain_per_s=1.0, center_hold_s=0.2,
+            lost_lock_timeout_s=0.6, command_rate_hz=50.0)
+
+
+def hardware(vehicle, monkeypatch, **param_overrides):
+    """Points main() at the simulated vehicle, with the mission and FC params loaded."""
+    load(vehicle, good_mission())
+    vehicle.params.update(GOOD_FC_PARAMS, **param_overrides)
+    vehicle.link.close = lambda: None
+    monkeypatch.setattr(run_flight.Link, "connect", staticmethod(lambda config: vehicle.link))
+
+
+def run_files(log_dir, name):
+    logs = glob.glob(os.path.join(str(log_dir), "*_%s.log" % name))
+    assert len(logs) == 1, logs
+    stem = logs[0][:-4]
+    assert re.match(r"\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d_%s$" % name, os.path.basename(stem))
+    return stem, open(logs[0]).read()
+
+
+def csv_rows(path):
+    with open(path) as f:
+        return list(csv.DictReader(f))
+
+
+def test_fc_setup_report_ok(vehicle):
+    vehicle.params.update(GOOD_FC_PARAMS)
+    assert run_flight.log_fc_setup(vehicle.link, HandoverConfig()) == []
+
+
+def test_fc_setup_report_warns(vehicle):
+    vehicle.params.update(GOOD_FC_PARAMS, SERIAL2_BAUD=57, BRD_SER2_RTSCTS=2, SYSID_MYGCS=254)
+    del vehicle.params["SERIAL2_OPTIONS"]       # missing params are only reported
+    warnings = run_flight.log_fc_setup(vehicle.link, HandoverConfig())
+    assert len(warnings) == 3
+    assert any("SERIAL2_BAUD = 57" in w for w in warnings)
+    assert any("BRD_SER2_RTSCTS = 2" in w for w in warnings)
+    assert any("SYSID_MYGCS = 254" in w for w in warnings)
+    sent = {c.method for c in vehicle.link.calls}
+    assert sent == {"param_request_read_send"}  # read-only
+
+
+def test_check_only_writes_its_own_log(vehicle, monkeypatch, tmp_path):
+    hardware(vehicle, monkeypatch)
+    assert run_flight.main(["--check-only", "--log-dir", str(tmp_path)]) == 0
+    stem, text = run_files(tmp_path, "check")
+    assert "PRE-FLIGHT OK" in text
+    assert "guard DO_JUMP 6 -> release 7" in text
+    assert "FC param SYSID_MYGCS = 255" in text
+    assert "item 7: MAV_CMD_DO_SET_SERVO p1=7 p2=1900" in text      # whole mission logged
+    assert csv_rows(stem + "_telemetry.csv")
+    assert not os.path.exists(stem + "_handover.csv")               # no handover in a check
+    sent = {c.method for c in vehicle.link.calls}
+    assert sent <= {"mission_request_list_send", "mission_request_int_send", "mission_ack_send",
+                    "param_request_read_send"}
+
+
+def test_preflight_failure_is_logged(vehicle, monkeypatch, tmp_path):
+    hardware(vehicle, monkeypatch)
+    load(vehicle, [it for it in good_mission() if it.command != mavlink.MAV_CMD_DO_JUMP])
+    assert run_flight.main(["--check-only", "--name", "bad mission",
+                            "--log-dir", str(tmp_path)]) == 1
+    _, text = run_files(tmp_path, "bad-mission")
+    assert "PRE-FLIGHT FAILED" in text and "must be DO_JUMP" in text
+
+
+def test_whole_flight_through_main(vehicle, monkeypatch, tmp_path):
+    """SITL-style run: wait, handover (simulated target), FC release, mission, disarm."""
+    hardware(vehicle, monkeypatch)
+    monkeypatch.setattr(run_flight, "HandoverConfig",
+                        lambda **kw: HandoverConfig(**dict(FAST, **kw)))
+    target_lat = 35.05 + 1.5 / 111319.5           # 1.5 m north of where the vehicle starts
+
+    def pilot_and_fc():
+        time.sleep(0.5)
+        vehicle.armed, vehicle.mode, vehicle.alt_m = True, "AUTO", 7.62
+        vehicle.seq = 5                           # AUTO reaches NAV_GUIDED_ENABLE
+        while vehicle.seq != 8:                   # until the Jetson hands back
+            time.sleep(0.05)
+        time.sleep(1.5)
+        vehicle.armed = False                     # rest of the mission, landed
+
+    threading.Thread(target=pilot_and_fc, daemon=True).start()
+    assert run_flight.main(["--device", "tcp:127.0.0.1:5762", "--sim-target",
+                            "%.7f,-118.15" % target_lat, "--log-dir", str(tmp_path)]) == 0
+
+    stem, text = run_files(tmp_path, "sitl")
+    for expected in ("PRE-FLIGHT OK", "Handover started", "Locked: within",
+                     "Handing back to the FC at item 7", "Handover outcome: locked",
+                     "FC released the payload: servo7_raw 1100 -> 1900 us",
+                     "Mode STABILIZE -> AUTO", "Mission item 5 -> 8", "ARMED", "DISARMED",
+                     "RUN SUMMARY: handover locked, release confirmed"):
+        assert expected in text, expected
+    ticks = csv_rows(stem + "_handover.csv")
+    assert ticks[0]["phase"] == "ALIGN" and float(ticks[0]["fwd_m"]) > 1.0
+    assert ticks[-1]["phase"] == "locked"
+    telemetry = csv_rows(stem + "_telemetry.csv")
+    assert {"STABILIZE", "AUTO"} <= {r["mode"] for r in telemetry}
+    assert telemetry[-1]["release_servo_us"] == "1900"
+
+
+class FakeCamera:
+    """Stands in for VisionPipeline: a target 0.3 m ahead at 7.62 m."""
+
+    def __init__(self, size=(1920, 1080), stop_after=None, **_kwargs):
+        self.size = size
+        self.stop_after = stop_after
+        self.calls = 0
+        self.closed = False
+
+    def wait_for_frame(self, timeout_s):
+        return self.size
+
+    def detect(self):
+        self.calls += 1
+        if self.stop_after is not None and self.calls > self.stop_after:
+            raise KeyboardInterrupt  # the operator's Ctrl-C
+        w, h = self.size
+        return Detection(w / 2.0, h / 2.0 - 25, w, h, time.monotonic())
+
+    def close(self):
+        self.closed = True
+
+
+def fake_camera(monkeypatch, camera):
+    from mission_controller.vision import camera as camera_module
+    monkeypatch.setattr(camera_module, "VisionPipeline", lambda **kw: camera)
+
+
+def test_bench_mode_through_main(vehicle, monkeypatch, tmp_path):
+    hardware(vehicle, monkeypatch)
+    camera = FakeCamera(stop_after=30)
+    fake_camera(monkeypatch, camera)
+    before = len(vehicle.link.calls)
+    assert run_flight.main(["--device", "/dev/ttyTHS1", "--bench", "--bench-alt", "1.2",
+                            "--log-dir", str(tmp_path)]) == 0
+    stem, text = run_files(tmp_path, "bench")
+    assert "BENCH MODE at 1.20 m" in text and "Bench run stopped" in text
+    rows = csv_rows(stem + "_handover.csv")
+    assert len(rows) >= 20 and {r["sent"] for r in rows} == {"0"}
+    assert float(rows[0]["fwd_m"]) > 0 and float(rows[0]["alt_m"]) == 1.2   # target ahead
+    after = {c.method for c in vehicle.link.calls[before:]}
+    assert after <= {"mission_request_list_send", "mission_request_int_send", "mission_ack_send",
+                     "param_request_read_send"}                     # nothing that moves it
+    assert camera.closed
+
+
+def test_no_camera_frame_fails_preflight(vehicle, monkeypatch, tmp_path):
+    hardware(vehicle, monkeypatch)
+    camera = FakeCamera(size=None)
+    fake_camera(monkeypatch, camera)
+    assert run_flight.main(["--log-dir", str(tmp_path)]) == 1
+    _, text = run_files(tmp_path, "flight")
+    assert "PRE-FLIGHT FAILED: camera 0 gave no frame" in text
+    assert camera.closed
+    assert not any(c.method == "set_position_target_local_ned_send" for c in vehicle.link.calls)
+
+
+def test_wrong_camera_size_warns(caplog):
+    with caplog.at_level("WARNING"):
+        run_flight.check_camera(FakeCamera(size=(640, 480)), HandoverConfig())
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "not the requested 1920x1080" in text and "not 16:9" in text
+
+
+@pytest.mark.parametrize("argv", [["--bench", "--check-only"], ["--bench-alt", "2"],
+                                  ["--bench", "--bench-alt", "0"],
+                                  ["--bench", "--sim-target", "35,-118"]])
+def test_bench_argument_validation(argv):
+    with pytest.raises(SystemExit):
+        run_flight.main(argv)
