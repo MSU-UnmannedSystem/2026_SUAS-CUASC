@@ -2,8 +2,10 @@
 
 The pilot / Mission Planner uploads the mission, arms, takes off and starts
 AUTO; the FC flies to the target and down to the drop altitude. This script
-connects to the Cube, checks the loaded mission, the release servo and the
-camera, then sends nothing until AUTO reaches the NAV_GUIDED_ENABLE item. It
+connects to the Cube, finds the handover in the loaded mission, logs the Cube
+settings and checks the camera, then sends nothing until AUTO reaches the
+NAV_GUIDED_ENABLE item. Mission Planner does the pre-flight checks: the Cube
+settings and the mission layout are only logged and warned about here. It
 then centres over the target (see guidance/handover.py) and hands back; the
 FC fires the release (the mission's DO_SET_SERVO) and flies the rest. It stays
 connected, recording, until the vehicle disarms.
@@ -13,7 +15,7 @@ flight_log.py), named ``<date>_<time>_<name>``::
 
     python3 mission_controller/run_flight.py                    # flight
     python3 mission_controller/run_flight.py --name field-test-1
-    python3 mission_controller/run_flight.py --check-only       # pre-flight checks, then exit
+    python3 mission_controller/run_flight.py --check-only       # log the Cube setup, then exit
     python3 mission_controller/run_flight.py --bench --bench-alt 1.5   # camera + data flow on the ground
 
 ``--bench`` runs guidance against the real Cube and camera on the ground, using
@@ -37,12 +39,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from mission_controller import flight_log  # noqa: E402
 from mission_controller.config.flight_params import HandoverConfig  # noqa: E402
 from mission_controller.guidance.handover import (  # noqa: E402
-    LINK_LOST, LOCKED, TRACE_FIELDS, HandoverController)
+    FLOWN_ALT_M, LINK_LOST, LOCKED, TRACE_FIELDS, HandoverController)
 from mission_controller.vehicle import commands, params  # noqa: E402
 from mission_controller.vehicle.link import (  # noqa: E402
     Link, LinkConfig, LinkStreamError, LinkTimeoutError)
 from mission_controller.vehicle.mission import (  # noqa: E402
-    HandoverPlan, MissionError, check_mission, download_items)
+    HandoverPlan, MissionError, download_items, find_handover)
 
 logger = logging.getLogger("run_flight")
 
@@ -52,56 +54,45 @@ logger = logging.getLogger("run_flight")
 DO_SET_SERVO_FUNCTIONS = {0, 1, 22, 23, 28} | set(range(51, 67)) | set(range(140, 156))
 
 
-def check_release_servo(link: Link, channel: int) -> None:
-    """Fails if MAV_CMD_DO_SET_SERVO can't move the release output.
+def load_handover(link: Link, config: HandoverConfig) -> Optional[HandoverPlan]:
+    """Downloads the mission, logs it, and finds the handover items. Never fails the run.
 
-    Raises:
-        RuntimeError: SERVOn_FUNCTION is unreadable or assigned to another function.
+    Returns:
+        The handover plan, or None if the mission couldn't be read or has no
+        handover (the Jetson then only records this flight).
     """
-    name = "SERVO%d_FUNCTION" % channel
-    param = params.read_param(link, name)
-    if param is None:
-        raise RuntimeError("Could not read %s" % name)
-    function = int(param.value)
-    if function not in DO_SET_SERVO_FUNCTIONS:
-        raise RuntimeError("%s = %d: ArduPilot will reject DO_SET_SERVO on this output; set it to "
-                           "0 (Disabled)" % (name, function))
-    logger.info("%s = %d: DO_SET_SERVO allowed", name, function)
-
-
-def preflight(link: Link, config: HandoverConfig) -> HandoverPlan:
-    """Downloads and checks the mission, and checks the release servo."""
-    items = download_items(link)
+    try:
+        items = download_items(link)
+    except MissionError as e:
+        logger.warning("Could not download the mission (%s): the Jetson won't guide this flight",
+                       e)
+        return None
     logger.info("Mission loaded on the Cube: %d items", len(items))
     for seq, item in enumerate(items):
         logger.debug("  item %d: %s p1=%g p2=%g p3=%g p4=%g lat=%.7f lon=%.7f alt=%.2f", seq,
                      commands._enum_name("MAV_CMD", item.command), item.param1, item.param2,
                      item.param3, item.param4, item.lat_deg, item.lon_deg, item.alt_m)
-    plan = check_mission(items, config.drop_alt_m, config.servo_channel,
-                         config.servo_release_pwm_us)
-    check_release_servo(link, config.servo_channel)
-    logger.info("Mode %s, %s", commands.current_mode(link),
-                "armed" if link.latest("HEARTBEAT").base_mode
-                & commands.mavlink.MAV_MODE_FLAG_SAFETY_ARMED else "disarmed")
-    return plan
+    return find_handover(items, config.servo_channel)
 
 
 def log_fc_setup(link: Link, config: HandoverConfig) -> List[str]:
     """Reads and logs the Cube settings this setup depends on; warns about suspicious ones.
 
-    Read-only, and never fails the run: the link is already working, so these
-    are reported for the log and the operator rather than enforced.
+    Read-only, and never fails the run: they're reported for the log and the
+    operator, and the run carries on with whatever the Cube has.
 
     Returns:
         The warnings logged.
     """
     port = config.fc_serial_port
-    baud_code = config.baud // 1000  # SERIALn_BAUD is in kbaud (921600 -> 921)
+    # SERIALn_BAUD is normally in kbaud (921 = 921600); ArduPilot also takes the full rate.
+    baud_codes = (config.baud // 1000, config.baud)
+    servo = "SERVO%d_FUNCTION" % config.servo_channel
     checks = [
         (("SERIAL%d_PROTOCOL" % port,), lambda v: v == 2,
          "should be 2 (MAVLink2) on the Jetson's port (SERIAL%d)" % port),
-        (("SERIAL%d_BAUD" % port,), lambda v: v == baud_code,
-         "should be %d to match the Jetson's %d baud" % (baud_code, config.baud)),
+        (("SERIAL%d_BAUD" % port,), lambda v: v in baud_codes,
+         "should be %d to match the Jetson's %d baud" % (baud_codes[0], config.baud)),
         (("BRD_SER%d_RTSCTS" % port,), lambda v: v == 0,
          "should be 0 (no flow control) for a 3-wire TX/RX/GND UART"),
         (("SERIAL%d_OPTIONS" % port,), lambda v: v == 0,
@@ -109,6 +100,9 @@ def log_fc_setup(link: Link, config: HandoverConfig) -> List[str]:
         (("MAV_GCS_SYSID", "SYSID_MYGCS"), lambda v: v == link.source_system,
          "should be %d, or the FC won't count the Jetson's heartbeat as a GCS"
          % link.source_system),
+        ((servo,), lambda v: int(v) in DO_SET_SERVO_FUNCTIONS,
+         "is assigned to another function: ArduPilot will reject the mission's DO_SET_SERVO, so "
+         "the release won't fire. Set it to 0 (Disabled)"),
         (("GUID_TIMEOUT",), None, None),
         (("FS_GCS_ENABLE",), None, None),
         (("FS_GCS_TIMEOUT",), None, None),
@@ -169,12 +163,23 @@ def confirm_fc_release(link: Link, channel: int, pwm_us: int, before_us: Optiona
     return False
 
 
-def wait_until_disarmed(link: Link) -> None:
-    """Stays connected (heartbeats keep running) and reports progress until the vehicle disarms."""
+def wait_until_disarmed(link: Link, flown: bool = True) -> None:
+    """Stays connected (heartbeats keep running) and reports progress until the vehicle disarms.
+
+    Args:
+        link: Connected link.
+        flown: The vehicle has already flown. If False, a disarm only counts once
+            it has been armed above FLOWN_ALT_M, so a disarm on the ground before
+            takeoff keeps it waiting.
+    """
     last_report = 0.0
     while True:
         hb = link.latest("HEARTBEAT")
-        if hb is not None and not hb.base_mode & commands.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
+        armed = hb is not None and bool(hb.base_mode & commands.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        pos = link.latest("GLOBAL_POSITION_INT")
+        if armed and pos is not None and pos.relative_alt / 1000.0 > FLOWN_ALT_M:
+            flown = True
+        if flown and hb is not None and not armed:
             logger.info("Vehicle disarmed; flight over")
             return
         if time.monotonic() - last_report > 5.0:
@@ -237,7 +242,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--camera", type=_camera_arg, default=defaults.camera_index,
                         help="camera index or device path (default %(default)s = /dev/video0)")
     parser.add_argument("--check-only", action="store_true",
-                        help="run the pre-flight checks and exit")
+                        help="connect, log the mission and Cube settings, and exit")
     parser.add_argument("--bench", action="store_true",
                         help="on the ground: run guidance on the real camera and Cube, send nothing")
     parser.add_argument("--bench-alt", type=float, default=None, metavar="M",
@@ -306,15 +311,11 @@ def _run(args: argparse.Namespace, sim_target, run_log: flight_log.RunLog) -> in
         recorder = flight_log.TelemetryRecorder(link, run_log.telemetry_path,
                                                 config.servo_channel)
         recorder.start()
-        plan = None  # type: Optional[HandoverPlan]
-        try:
-            plan = preflight(link, config)
-        except (MissionError, RuntimeError) as e:
-            if not args.bench:
-                logger.error("PRE-FLIGHT FAILED: %s", e)
-                return 1
-            logger.warning("Pre-flight check failed (%s); bench mode continues anyway", e)
+        plan = load_handover(link, config)
         log_fc_setup(link, config)
+        logger.info("Mode %s, %s", commands.current_mode(link),
+                    "armed" if link.latest("HEARTBEAT").base_mode
+                    & commands.mavlink.MAV_MODE_FLAG_SAFETY_ARMED else "disarmed")
 
         if sim_target is not None:
             from mission_controller.sitl.sim_detector import SimTargetDetector
@@ -335,11 +336,12 @@ def _run(args: argparse.Namespace, sim_target, run_log: flight_log.RunLog) -> in
             try:
                 check_camera(detector, config)
             except RuntimeError as e:
-                logger.error("PRE-FLIGHT FAILED: %s", e)
+                logger.error("CAMERA FAILED: %s", e)
                 return 1
-        logger.info("PRE-FLIGHT OK")
         if args.check_only:
+            logger.info("CHECK DONE")
             return 0
+        logger.info("READY")
 
         trace_csv = flight_log.CsvLog(run_log.handover_path, TRACE_FIELDS)
         if args.bench:
@@ -348,8 +350,14 @@ def _run(args: argparse.Namespace, sim_target, run_log: flight_log.RunLog) -> in
                       trace_csv.write)
             return 0  # not reached: bench runs until Ctrl-C
 
-        controller = HandoverController(link, detector, plan, config, trace=trace_csv.write)
         outcome, released = None, None
+        if plan is None:
+            logger.warning("No handover in the loaded mission: recording only, the Jetson sends "
+                           "nothing this flight")
+            wait_until_disarmed(link, flown=False)
+            logger.info("RUN SUMMARY: no handover in the mission, nothing sent")
+            return 0
+        controller = HandoverController(link, detector, plan, config, trace=trace_csv.write)
         if controller.wait_for_handover():
             servo_before = servo_output_us(link, config.servo_channel)
             outcome = controller.run()

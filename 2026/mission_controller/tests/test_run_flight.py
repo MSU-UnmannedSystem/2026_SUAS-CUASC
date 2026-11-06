@@ -7,7 +7,6 @@ from pymavlink import mavutil
 
 from mission_controller import run_flight
 from mission_controller.config.flight_params import HandoverConfig
-from mission_controller.vehicle.mission import MissionCheckError
 
 from link_fakes import FakeLink, NavGuidedVehicle
 from test_mission_check import good_mission
@@ -32,36 +31,33 @@ def vehicle(background):
     return sim
 
 
-def test_preflight_ok_sends_only_reads(vehicle):
+def test_load_handover_sends_only_reads(vehicle):
     load(vehicle, good_mission())
-    plan = run_flight.preflight(vehicle.link, HandoverConfig())
-    assert (plan.guided_seq, plan.jump_seq, plan.release_seq, plan.resume_seq) == (5, 6, 7, 8)
+    plan = run_flight.load_handover(vehicle.link, HandoverConfig())
+    assert (plan.guided_seq, plan.release_seq, plan.resume_seq) == (5, 7, 8)
     sent = {c.method for c in vehicle.link.calls}
-    assert sent <= {"mission_request_list_send", "mission_request_int_send", "mission_ack_send",
-                    "param_request_read_send"}
+    assert sent <= {"mission_request_list_send", "mission_request_int_send", "mission_ack_send"}
 
 
-def test_preflight_rejects_mission_without_handover(vehicle):
+def test_load_handover_without_handover_is_none(vehicle):
     load(vehicle, [it for it in good_mission() if it.command != mavlink.MAV_CMD_NAV_GUIDED_ENABLE])
-    with pytest.raises(MissionCheckError):
-        run_flight.preflight(vehicle.link, HandoverConfig())
+    assert run_flight.load_handover(vehicle.link, HandoverConfig()) is None
+
+
+def test_load_handover_unreadable_mission_is_none(vehicle, monkeypatch):
+    def fail(link):
+        raise run_flight.MissionError("No MISSION_COUNT after 3 re-send(s)")
+    monkeypatch.setattr(run_flight, "download_items", fail)
+    assert run_flight.load_handover(vehicle.link, HandoverConfig()) is None
 
 
 @pytest.mark.parametrize("function, ok", [(0, True), (1, True), (28, True), (51, True),
                                           (33, False), (70, False)])
-def test_release_servo_function(vehicle, function, ok):
-    vehicle.params["SERVO7_FUNCTION"] = float(function)
-    if ok:
-        run_flight.check_release_servo(vehicle.link, 7)
-    else:
-        with pytest.raises(RuntimeError, match="SERVO7_FUNCTION"):
-            run_flight.check_release_servo(vehicle.link, 7)
-
-
-def test_release_servo_unreadable(vehicle):
-    del vehicle.params["SERVO7_FUNCTION"]
-    with pytest.raises(RuntimeError, match="Could not read"):
-        run_flight.check_release_servo(vehicle.link, 7)
+def test_release_servo_function_only_warns(vehicle, function, ok):
+    vehicle.params.update(GOOD_FC_PARAMS, SERVO7_FUNCTION=float(function))
+    warnings = run_flight.log_fc_setup(vehicle.link, HandoverConfig())
+    assert (warnings == []) == ok
+    assert ok or "SERVO7_FUNCTION = %d" % function in warnings[0]
 
 
 def test_confirm_fc_release(vehicle):
@@ -174,8 +170,9 @@ def csv_rows(path):
         return list(csv.DictReader(f))
 
 
-def test_fc_setup_report_ok(vehicle):
-    vehicle.params.update(GOOD_FC_PARAMS)
+@pytest.mark.parametrize("baud", [921, 921600])
+def test_fc_setup_report_ok(vehicle, baud):
+    vehicle.params.update(GOOD_FC_PARAMS, SERIAL2_BAUD=baud)   # ArduPilot takes both forms
     assert run_flight.log_fc_setup(vehicle.link, HandoverConfig()) == []
 
 
@@ -195,8 +192,9 @@ def test_check_only_writes_its_own_log(vehicle, monkeypatch, tmp_path):
     hardware(vehicle, monkeypatch)
     assert run_flight.main(["--check-only", "--log-dir", str(tmp_path)]) == 0
     stem, text = run_files(tmp_path, "check")
-    assert "PRE-FLIGHT OK" in text
-    assert "guard DO_JUMP 6 -> release 7" in text
+    assert "CHECK DONE" in text
+    assert "NAV_GUIDED_ENABLE 5 -> guard DO_JUMP 6 -> release 7 (servo 7, PWM 1900) -> resume 8" \
+        in text
     assert "FC param SYSID_MYGCS = 255" in text
     assert "item 7: MAV_CMD_DO_SET_SERVO p1=7 p2=1900" in text      # whole mission logged
     assert csv_rows(stem + "_telemetry.csv")
@@ -206,13 +204,34 @@ def test_check_only_writes_its_own_log(vehicle, monkeypatch, tmp_path):
                     "param_request_read_send"}
 
 
-def test_preflight_failure_is_logged(vehicle, monkeypatch, tmp_path):
-    hardware(vehicle, monkeypatch)
+def test_bad_setup_only_warns(vehicle, monkeypatch, tmp_path):
+    """Mission Planner does the pre-flight checks: the Jetson warns and carries on."""
+    hardware(vehicle, monkeypatch, SERVO7_FUNCTION=33, SERIAL2_BAUD=57)
     load(vehicle, [it for it in good_mission() if it.command != mavlink.MAV_CMD_DO_JUMP])
-    assert run_flight.main(["--check-only", "--name", "bad mission",
-                            "--log-dir", str(tmp_path)]) == 1
-    _, text = run_files(tmp_path, "bad-mission")
-    assert "PRE-FLIGHT FAILED" in text and "must be DO_JUMP" in text
+    assert run_flight.main(["--check-only", "--name", "odd setup",
+                            "--log-dir", str(tmp_path)]) == 0
+    _, text = run_files(tmp_path, "odd-setup")
+    assert "no guard DO_JUMP" in text and "SERVO7_FUNCTION = 33" in text
+    assert "SERIAL2_BAUD = 57" in text and "CHECK DONE" in text
+
+
+def test_no_handover_records_only(vehicle, monkeypatch, tmp_path):
+    hardware(vehicle, monkeypatch)
+    load(vehicle, [it for it in good_mission() if it.command != mavlink.MAV_CMD_NAV_GUIDED_ENABLE])
+    fake_camera(monkeypatch, FakeCamera())
+
+    def pilot():
+        time.sleep(0.3)
+        vehicle.armed, vehicle.mode, vehicle.alt_m = True, "AUTO", 10.0
+        time.sleep(0.5)
+        vehicle.armed = False
+
+    threading.Thread(target=pilot, daemon=True).start()
+    assert run_flight.main(["--log-dir", str(tmp_path)]) == 0
+    _, text = run_files(tmp_path, "flight")
+    assert "No NAV_GUIDED_ENABLE" in text and "recording only" in text
+    assert "RUN SUMMARY: no handover in the mission, nothing sent" in text
+    assert not any(c.method == "set_position_target_local_ned_send" for c in vehicle.link.calls)
 
 
 def test_whole_flight_through_main(vehicle, monkeypatch, tmp_path):
@@ -236,7 +255,7 @@ def test_whole_flight_through_main(vehicle, monkeypatch, tmp_path):
                             "%.7f,-118.15" % target_lat, "--log-dir", str(tmp_path)]) == 0
 
     stem, text = run_files(tmp_path, "sitl")
-    for expected in ("PRE-FLIGHT OK", "Handover started", "Locked: within",
+    for expected in ("READY", "Handover started", "Locked: within",
                      "Handing back to the FC at item 7", "Handover outcome: locked",
                      "FC released the payload: servo7_raw 1100 -> 1900 us",
                      "Mode STABILIZE -> AUTO", "Mission item 5 -> 8", "ARMED", "DISARMED",
@@ -296,13 +315,13 @@ def test_bench_mode_through_main(vehicle, monkeypatch, tmp_path):
     assert camera.closed
 
 
-def test_no_camera_frame_fails_preflight(vehicle, monkeypatch, tmp_path):
+def test_no_camera_frame_stops_the_run(vehicle, monkeypatch, tmp_path):
     hardware(vehicle, monkeypatch)
     camera = FakeCamera(size=None)
     fake_camera(monkeypatch, camera)
     assert run_flight.main(["--log-dir", str(tmp_path)]) == 1
     _, text = run_files(tmp_path, "flight")
-    assert "PRE-FLIGHT FAILED: camera 0 gave no frame" in text
+    assert "CAMERA FAILED: camera 0 gave no frame" in text
     assert camera.closed
     assert not any(c.method == "set_position_target_local_ned_send" for c in vehicle.link.calls)
 

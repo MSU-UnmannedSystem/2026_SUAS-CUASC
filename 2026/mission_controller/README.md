@@ -29,15 +29,19 @@ read-back, params) were copied in, so it doesn't import `drone_simulator` at all
      WAYPOINT ...      resume: the rest of the mission
 ```
 
-`run_flight.py` refuses to start unless the loaded mission has:
-- exactly one `GUIDED_ENABLE` (p1 = 1);
-- a `DO_GUIDED_LIMITS` between the waypoint before it and it, with sane values;
-- right after it, the guard `DO_JUMP` to the resume waypoint with repeat −1;
-- then the release `DO_SET_SERVO` (servo 7, 1900);
-- then the resume waypoint (the jump's target).
+Mission Planner does the pre-flight checks, so `run_flight.py` doesn't validate the mission. It
+only finds the items it needs and logs the layout it found:
+- the first `GUIDED_ENABLE` (p1 = 1): where it guides;
+- the first `DO_SET_SERVO` on servo 7 after it: where it hands back on a lock (the release);
+- the first waypoint after that: where it hands back on lost lock (release skipped).
 
-The drop altitude isn't checked before flight. The Jetson checks the real altitude when the
-handover starts.
+If there's no `GUIDED_ENABLE` (or nothing after it), it logs a warning and only records the
+flight, sending nothing. If there's no release item, a lock hands back past it and nothing is
+released. **Nothing checks the guard `DO_JUMP` or the `DO_GUIDED_LIMITS` values any more:**
+without the guard, an FC fallback (limits timeout, dead Jetson) runs the release. Check the layout
+line in the log (`NAV_GUIDED_ENABLE 5 -> guard DO_JUMP 6 -> release 7 ... -> resume 8`).
+
+The Jetson checks the real altitude when the handover starts.
 
 **The rough waypoint has to be close.** At 7.62 m, the camera (65° × 39.4°, straight down) sees only
 about **5.5 m nose-to-tail × 9.7 m side-to-side** of ground: ±2.7 m forward/back and ±4.9 m
@@ -52,16 +56,16 @@ close to home but not guaranteed to be the same. Leave margin.
 | Parameter | Value | Why |
 |---|---|---|
 | `SERIAL2_PROTOCOL` | 2 | MAVLink2 |
-| `SERIAL2_BAUD` | 921 | 921600, matches `--baud` |
+| `SERIAL2_BAUD` | 921 | 921600, matches `--baud` (921600 also works) |
 | `BRD_SER2_RTSCTS` | 0 | No flow control: the Jetson link is 3-wire TX/RX/GND |
 | `SERIAL2_OPTIONS` | 0 | The value the team's 3-wire link is known to work with |
 | `SYSID_MYGCS` | 255 | The Jetson's heartbeat counts as a GCS (4.7+ renames it `MAV_GCS_SYSID`) |
-| `SERVO7_FUNCTION` | 0 | Disabled. Otherwise ArduPilot rejects DO_SET_SERVO (pre-flight **fails** on this) |
+| `SERVO7_FUNCTION` | 0 | Disabled. Otherwise ArduPilot rejects DO_SET_SERVO and **the release never fires** |
 | `GUID_TIMEOUT` | 3 (default) | How long without a Jetson setpoint before the drone stops and holds |
 | `FS_GCS_ENABLE` | team decision | The Jetson's heartbeat keeps this failsafe from firing even if Mission Planner drops |
 
 Every run reads all of these from the Cube and logs them. Anything that looks wrong is logged as
-a warning; only `SERVO7_FUNCTION` stops the run.
+a warning, and the run carries on: none of them stops it.
 
 ## The handover (`guidance/handover.py`)
 
@@ -119,15 +123,16 @@ python3 -m pytest mission_controller/tests -v       # all pass, camera tests inc
 From the `2026` folder (or by full path). The defaults are `/dev/ttyTHS1` @ 921600 and camera 0.
 
 ```bash
-python3 mission_controller/run_flight.py --check-only               # read-only checks, then exit
+python3 mission_controller/run_flight.py --check-only               # log the Cube setup, then exit
 python3 mission_controller/run_flight.py --bench --bench-alt 1.5    # on the ground, sends nothing
 python3 mission_controller/run_flight.py --name field-test-1        # flight
 ```
 
-- **`--check-only`:** connects, downloads and checks the mission, reads the Cube's settings,
-  then exits. It doesn't open the camera.
-- **Flight (no flag):** the same checks, then the camera must deliver a frame within 5 s, or it
-  refuses to start (`PRE-FLIGHT FAILED`). It then waits silently for AUTO to reach
+- **`--check-only`:** connects, downloads the mission and logs the handover it found, reads and
+  logs the Cube's settings (with warnings), prints `CHECK DONE` and exits. It doesn't open the
+  camera. Use it to test the link.
+- **Flight (no flag):** the same, then the camera must deliver a frame within 5 s, or it stops
+  (`CAMERA FAILED`). That's the only check that stops a run. Then `READY`, and it waits silently for AUTO to reach
   `GUIDED_ENABLE`, runs the handover, confirms the FC's release, and keeps recording until the
   vehicle disarms.
 - **`--bench`:** for checking the camera and the Jetson <-> Cube data flow without flying (props
@@ -135,8 +140,7 @@ python3 mission_controller/run_flight.py --name field-test-1        # flight
   uses the Cube's live attitude, and `--bench-alt` (camera height above the target, in m) in place
   of altitude. **It sends nothing that moves anything**: no setpoints, no hand-back. Each second
   it logs the target offset and the velocity it *would* command. When it would lock, or give up,
-  it logs which mission item it would hand back at, then starts again. Ctrl-C stops it. A failed
-  mission check is only a warning here.
+  it logs which mission item it would hand back at, then starts again. Ctrl-C stops it.
 
 ## Logs: one set of files per run
 
@@ -250,6 +254,24 @@ Results with the guard `DO_JUMP` (2026-11-03 and 2026-11-05):
   went straight to "Mission: 8 WP", following the guard past the release. It RTL'd and landed.
   Servo 7 stayed at 0 in all 144 one-second samples.
 
+Results with the flight logging, bench mode and camera changes (2026-11-05, dataflash
+`00000021.BIN`, run logs `sitl-lock`, `sitl-lostlock`, `sitl-killed`):
+
+- **Lock → release:** centred from 2.47 m to 0.07 m at 7.63–7.65 m and locked after 2 s, about
+  4.4 s in. It handed back at item 7. The FC released (`servo7_raw 0 -> 1900`), continued at item 8,
+  then RTL'd and landed. Summary: `handover locked, release confirmed`.
+- **Lost lock (`--sim-hide-after 3`):** the target vanished 1.9 m off. Commands went to zero, and
+  it held at 7.63 m for 10 s, then handed back at item 8. The FC went 5 → 8 without running the
+  release item. Summary: `gave_up, release not attempted`. (Servo 7 was left at 1900 from the run
+  before, so this run shows the skip only in the mission log: reset it first.)
+- **Jetson killed (`handover_fallback_test.waypoints`, Ctrl-C 3.5 s into the handover):** the FC
+  kept flying the last velocity setpoint (0.5 m/s) for about 3 s (`GUID_TIMEOUT`), about 1.9 m,
+  then held at 7.63 m. It jumped to item 8 exactly 15.0 s after GuidedEnable, then RTL'd and
+  landed. Servo 7 stayed at 1100.
+- The Jetson's logs end at the kill, so the FC's fallback has to be checked in the dataflash log.
+  The `wall_time` column jumped backwards twice in the lock run (WSL2 clock correction). `t_s` is
+  monotonic and was unaffected.
+
 **Real camera against SITL** (sign check without flying): run the Jetson code without
 `--sim-target`, pointed at SITL on the laptop (`--device tcp:<laptop-ip>:5762`; SITL must accept
 connections from the Jetson's network). Fly SITL to the handover and move the real target. The
@@ -271,8 +293,9 @@ Don't move on until each stage passes. Keep every stage's log files.
 2. **Cube (Mission Planner):** set the parameters above; upload a mission with the required layout.
    If Mission Planner won't take `GUIDED_ENABLE` or a `DO_JUMP` with repeat -1, stop: everything
    depends on them.
-3. **Link (props off):** `--check-only`. Pass: `PRE-FLIGHT OK`, the handover line shows
-   `NAV_GUIDED_ENABLE 5 -> guard DO_JUMP 6 -> release 7 -> resume 8`, no `FC param` warnings.
+3. **Link (props off):** `--check-only`. Pass: `CHECK DONE`, the handover line shows
+   `NAV_GUIDED_ENABLE 5 -> guard DO_JUMP 6 -> release 7 (servo 7, PWM 1900) -> resume 8`, no
+   `FC param` warnings.
    Then run the flight command and leave it waiting 10 min. Pass: no setpoints or mission changes
    (it only sends heartbeats, stream requests, and the start-up mission/param reads). Pull the
    UART wire for 10 s and reconnect. Pass: `Link ... down (silence ...)`, then `recovered`, then
@@ -315,6 +338,6 @@ simulated `NAV_GUIDED_ENABLE` vehicle that handles hand-back like ArduPilot:
 
 They also run whole sessions through `run_flight.main()`: a check-only run, a full simulated
 flight, bench mode, and a missing camera. Each checks the log files it writes. They also cover the
-mission check, the Cube settings report, the camera maths and capture start-up, the per-run log
+finding the handover in the mission, the Cube settings report, the camera maths and capture start-up, the per-run log
 files and telemetry recorder, and the copied Link, command and param tests. Tests never write
 into `logs/`. `test_camera.py` is skipped where OpenCV isn't installed.

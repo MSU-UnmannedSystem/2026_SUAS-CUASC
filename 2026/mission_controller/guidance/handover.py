@@ -80,7 +80,7 @@ class HandoverController:
     Args:
         link: Connected link (the Link's own heartbeat keeps running throughout).
         detector: Target detector (camera).
-        plan: Handover location and FC limits from ``vehicle.mission.check_mission``.
+        plan: Handover items from ``vehicle.mission.find_handover``.
         config: Speeds, tolerances and the drop altitude.
         trace: Called with one dict (keys TRACE_FIELDS) per guidance tick, e.g. a
             CsvLog's ``write``. Errors in it are logged and never stop guidance.
@@ -322,6 +322,14 @@ class HandoverController:
             self._status(alt_m, offset, (vx, vy))
             time.sleep(max(0.0, self._period_s - (time.monotonic() - tick)))
 
+    def _hand_back_item(self, release: bool) -> Tuple[int, str]:
+        """(mission item to hand back at, why) for a release or a skip."""
+        if not release:
+            return self.plan.resume_seq, "release skipped"
+        if self.plan.release_seq is None:
+            return self.plan.resume_seq, "no release item in the mission: nothing released"
+        return self.plan.release_seq, "DO_SET_SERVO: FC releases"
+
     def _hand_back(self, release: bool, outcome: str) -> str:
         """Gives control back to the FC: at the DO_SET_SERVO (release) or past it."""
         if self.bench_alt_m is not None:
@@ -329,19 +337,18 @@ class HandoverController:
                 logger.info("BENCH: %s; would hand back %s (no valid mission loaded)", outcome,
                             "at the release" if release else "past the release")
             else:
+                seq, why = self._hand_back_item(release)
                 logger.info("BENCH: %s; would hand back at item %d (%s). Nothing sent.", outcome,
-                            self.plan.release_seq if release else self.plan.resume_seq,
-                            "DO_SET_SERVO: FC releases" if release else "release skipped")
+                            seq, why)
             return outcome
         self._send(0.0, 0.0, 0.0)
-        seq = self.plan.release_seq if release else self.plan.resume_seq
-        logger.info("Handing back to the FC at item %d (%s)", seq,
-                    "DO_SET_SERVO: FC releases" if release else "release skipped")
+        seq, why = self._hand_back_item(release)
+        logger.info("Handing back to the FC at item %d (%s)", seq, why)
         try:
             commands.set_mission_current(self.link, seq, expect_seq=self.plan.resume_seq)
         except CommandError as e:
-            # The FC's DO_GUIDED_LIMITS timeout will still move the mission on, and it will
-            # then run the DO_SET_SERVO.
+            # The FC's DO_GUIDED_LIMITS timeout still ends the handover (past the release,
+            # via the guard DO_JUMP).
             logger.error("Hand-back to item %d not confirmed (%s); the FC limits timeout will "
                          "end the handover", seq, e)
         logger.info("Handover finished: %s", outcome)
