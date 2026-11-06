@@ -2,7 +2,7 @@ import pytest
 from pymavlink import mavutil
 
 from mission_controller.vehicle.mission import (
-    MissionCheckError, MissionItem, check_mission, download_items)
+    MissionItem, download_items, find_handover)
 
 from link_fakes import FakeLink, MissionSim
 
@@ -47,69 +47,66 @@ def good_mission():
     ]
 
 
-def check(items):
-    return check_mission(items, DROP_ALT, SERVO, PWM)
+def find(items):
+    return find_handover(items, SERVO)
 
 
 def test_good_mission():
-    plan = check(good_mission())
-    assert (plan.target_seq, plan.limits_seq, plan.guided_seq, plan.jump_seq, plan.release_seq,
-            plan.resume_seq) == (3, 4, 5, 6, 7, 8)
-    assert plan.target_alt_m == DROP_ALT
-    assert (plan.timeout_s, plan.alt_min_m, plan.alt_max_m, plan.horiz_max_m) == (
-        120.0, 5.0, 12.0, 25.0)
-
-
-def test_drop_altitude_is_not_checked_before_flight():
-    items = good_mission()
-    items[3] = wp(35.0610, -118.1570, 15.0)   # no descent waypoint: checked at handover time
-    assert check(items).target_alt_m == 15.0
+    plan = find(good_mission())
+    assert (plan.guided_seq, plan.release_seq, plan.resume_seq) == (5, 7, 8)
 
 
 def test_disable_items_are_not_handovers():
     items = good_mission()
-    items.insert(9, enable(on=0.0))
-    assert check(items).guided_seq == 5
+    items.insert(5, enable(on=0.0))
+    assert find(items).guided_seq == 6
 
 
-@pytest.mark.parametrize("mutate, message", [
-    (lambda m: m.pop(5), "exactly one NAV_GUIDED_ENABLE"),
-    (lambda m: m.insert(8, enable()), "exactly one NAV_GUIDED_ENABLE"),
-    (lambda m: m.pop(4), "No DO_GUIDED_LIMITS"),
-    (lambda m: m.__setitem__(4, limits(timeout=0)), "timeout"),
-    (lambda m: m.__setitem__(4, limits(horiz=0)), "horizontal limit"),
-    (lambda m: m.__setitem__(4, limits(alt_min=0)), "min alt"),
-    (lambda m: m.__setitem__(4, limits(alt_min=8.0)), "min alt"),
-    (lambda m: m.__setitem__(4, limits(alt_max=7.0)), "max alt"),
-    (lambda m: m.pop(7), "must be DO_SET_SERVO"),
-    (lambda m: m.__setitem__(7, release(channel=6)), "must be DO_SET_SERVO servo 7"),
-    (lambda m: m.__setitem__(7, release(pwm=1100)), "PWM 1900"),
-    (lambda m: m.pop(6), "must be DO_JUMP"),                       # no guard
-    (lambda m: m.__setitem__(6, jump(target=9)), "must be DO_JUMP"),  # wrong target
-    (lambda m: m.__setitem__(6, jump(repeat=1.0)), "repeat -1"),
-    (lambda m: m.__setitem__(6, MissionItem(mavlink.MAV_CMD_DO_CHANGE_SPEED, 0, 1, 5)),
-     "must be DO_JUMP"),
-    (lambda m: (m.__setitem__(6, release()), m.__setitem__(7, jump())), "must be DO_JUMP"),
-    (lambda m: m.__delitem__(slice(8, None)), "no NAV item after the release"),
+@pytest.mark.parametrize("mutate", [
+    lambda m: m.pop(4),                                   # no DO_GUIDED_LIMITS
+    lambda m: m.__setitem__(4, limits(timeout=0, alt_min=0, alt_max=7.0, horiz=0)),
+    lambda m: m.pop(6),                                   # no guard
+    lambda m: m.__setitem__(6, jump(target=9, repeat=1.0)),
+    lambda m: m.__setitem__(7, release(pwm=1100)),
+    lambda m: m.__setitem__(3, wp(35.0610, -118.1570, 15.0)),
 ])
-def test_bad_missions(mutate, message):
+def test_layout_is_not_validated(mutate):
+    """Mission Planner checks the mission; the Jetson only needs to find the handover."""
     items = good_mission()
     mutate(items)
-    with pytest.raises(MissionCheckError, match=message):
-        check(items)
+    plan = find(items)
+    enable_seq = next(i for i, it in enumerate(items)
+                      if it.command == mavlink.MAV_CMD_NAV_GUIDED_ENABLE)
+    assert plan is not None and plan.guided_seq == enable_seq and plan.release_seq is not None
 
 
-def test_limits_before_the_target_waypoint_do_not_count():
+def test_release_and_guard_in_either_order():
     items = good_mission()
-    items.insert(3, items.pop(4))   # limits now before the descent waypoint
-    with pytest.raises(MissionCheckError, match="No DO_GUIDED_LIMITS"):
-        check(items)
+    items[6], items[7] = items[7], items[6]
+    assert (find(items).release_seq, find(items).resume_seq) == (6, 8)
 
 
-def test_unlimited_max_alt_is_allowed():
+@pytest.mark.parametrize("mutate", [lambda m: m.pop(7),
+                                    lambda m: m.__setitem__(7, release(channel=6))])
+def test_no_release_item(mutate):
     items = good_mission()
-    items[4] = limits(alt_max=0.0)
-    assert check(items).alt_max_m == 0.0
+    mutate(items)
+    plan = find(items)
+    assert plan.release_seq is None and plan.resume_seq == (7 if len(items) == 9 else 8)
+
+
+def test_first_handover_is_used():
+    items = good_mission()
+    items.insert(9, enable())
+    assert find(items).guided_seq == 5
+
+
+@pytest.mark.parametrize("mutate", [lambda m: m.pop(5),
+                                    lambda m: m.__delitem__(slice(8, None))])
+def test_no_handover(mutate):
+    items = good_mission()
+    mutate(items)
+    assert find(items) is None
 
 
 def stored(items):
@@ -117,12 +114,12 @@ def stored(items):
              int(it.lat_deg * 1e7), int(it.lon_deg * 1e7), it.alt_m, 1) for it in items]
 
 
-def test_download_then_check():
+def test_download_then_find():
     link = FakeLink()
     sim = MissionSim(link)
     sim.stored[0] = stored(good_mission())
     items = download_items(link)
     assert len(items) == 10
-    assert check(items).release_seq == 7
+    assert find(items).release_seq == 7
     assert not link.calls_to("mission_count_send")       # read-only: nothing uploaded
     assert not link.calls_to("mission_item_int_send")

@@ -13,9 +13,7 @@ from mission_controller.vehicle.mission import HandoverPlan
 
 from link_fakes import FakeLink, NavGuidedVehicle, SimDetector
 
-PLAN = HandoverPlan(target_seq=3, target_alt_m=7.62, limits_seq=4, guided_seq=5, jump_seq=6,
-                    release_seq=7, resume_seq=8, timeout_s=120.0, alt_min_m=5.0,
-                    alt_max_m=12.0, horiz_max_m=25.0)
+PLAN = HandoverPlan(guided_seq=5, release_seq=7, resume_seq=8)
 SET_MISSION_CURRENT = 224
 
 # Same logic as the flight defaults, compressed in time so the suite stays fast.
@@ -56,6 +54,15 @@ def test_lock_hands_back_at_release_item_and_fc_releases(vehicle):
     fwd, right = vehicle.offset_to_target()
     assert math.hypot(fwd, right) <= 0.5 + 0.05           # over the target
     assert not any(s.command == 183 for s in vehicle.link.sent)   # Jetson never fires it
+
+
+def test_lock_without_release_item_hands_back_past_it(vehicle):
+    detector = SimDetector(vehicle)
+    plan = HandoverPlan(guided_seq=5, release_seq=None, resume_seq=8)
+    controller = HandoverController(vehicle.link, detector, plan, HandoverConfig(**FAST))
+    assert controller.run() == handover.LOCKED
+    assert handbacks(vehicle) == [plan.resume_seq]
+    assert vehicle.servos == {}
 
 
 def test_horizontal_only(vehicle):

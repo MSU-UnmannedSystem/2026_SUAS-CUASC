@@ -35,13 +35,13 @@ def test_run_log_writes_everything_to_its_own_file(tmp_path):
     run = flight_log.RunLog.start(str(tmp_path / "new"), "flight", now=WHEN)
     try:
         logging.getLogger("some.module").debug("debug detail")
-        logging.getLogger("run_flight").info("PRE-FLIGHT OK")
+        logging.getLogger("run_flight").info("READY")
     finally:
         run.close()
     logging.getLogger("run_flight").info("after close")
     text = open(run.log_path).read()
     assert run.log_path.endswith("2026-11-05_14-32-10_flight.log")
-    assert "debug detail" in text and "PRE-FLIGHT OK" in text
+    assert "debug detail" in text and "READY" in text
     assert "after close" not in text
     run.close()  # idempotent
 
