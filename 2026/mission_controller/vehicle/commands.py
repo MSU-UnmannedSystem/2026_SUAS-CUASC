@@ -16,10 +16,10 @@ from typing import List, Optional, Sequence
 from pymavlink import mavutil
 
 from mission_controller.vehicle.link import Link, Subscription
+from mission_controller.vehicle.dialect import mavlink
 
 logger = logging.getLogger(__name__)
 
-mavlink = mavutil.mavlink
 
 _POLL_INTERVAL_S = 0.05
 _STATUSTEXT_DRAIN_S = 0.1  # trailing STATUSTEXTs collected after a rejection
@@ -243,7 +243,7 @@ def set_servo(link: Link, channel: int, pwm_us: int, timeout_s: float = 1.5) -> 
     last = None
     while True:
         msg, rx = link.latest_with_time("SERVO_OUTPUT_RAW")
-        if msg is not None and rx > sent_at:
+        if msg is not None and rx is not None and rx > sent_at:
             last = getattr(msg, field_name, None)
             if last is None:  # MAVLink1 SERVO_OUTPUT_RAW has only servo1-8
                 logger.warning("SERVO_OUTPUT_RAW has no %s; servo %d unverified",
@@ -329,7 +329,7 @@ def set_mission_current(link: Link, seq: int, expect_seq: Optional[int] = None,
     deadline = time.monotonic() + timeout_s
     while True:
         msg, rx = link.latest_with_time("MISSION_CURRENT")
-        if msg is not None and rx > sent_at and msg.seq == expect_seq:
+        if msg is not None and rx is not None and rx > sent_at and msg.seq == expect_seq:
             logger.info("Mission continuing at item %d", expect_seq)
             return
         if time.monotonic() >= deadline:

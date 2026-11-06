@@ -10,8 +10,8 @@ from pymavlink import mavutil
 
 from mission_controller.vehicle.link import (
     Link, LinkConfig, LinkStreamError, LinkTimeoutError)
+from mission_controller.vehicle.dialect import mavlink
 
-mavlink = mavutil.mavlink
 LINK_LOGGER = "mission_controller.vehicle.link"
 
 
@@ -21,7 +21,7 @@ def make_heartbeat(sysid, compid, mav_type, autopilot):
     msg = encoder.heartbeat_encode(mav_type, autopilot, 0, 0, mavlink.MAV_STATE_STANDBY)
     buf = msg.pack(encoder)
     parsed = mavlink.MAVLink(None).parse_buffer(bytes(buf))
-    assert len(parsed) == 1
+    assert parsed is not None and len(parsed) == 1
     return parsed[0]
 
 
@@ -112,7 +112,7 @@ class FakeMaster:
             if self.queue:
                 return self.queue.popleft()
         if self.repeat is not None:
-            time.sleep(min(self.repeat_interval, timeout))
+            time.sleep(self.repeat_interval if timeout is None else min(self.repeat_interval, timeout))
             return self.repeat
         return None
 
@@ -292,7 +292,9 @@ def make_msg(sysid, compid, name, *fields):
     """Encodes and re-parses any message, e.g. make_msg(1, 1, "mission_request", 255, 191, 0)."""
     encoder = mavlink.MAVLink(None, srcSystem=sysid, srcComponent=compid)
     msg = getattr(encoder, name + "_encode")(*fields)
-    return mavlink.MAVLink(None).parse_buffer(bytes(msg.pack(encoder)))[0]
+    parsed = mavlink.MAVLink(None).parse_buffer(bytes(msg.pack(encoder)))
+    assert parsed
+    return parsed[0]
 
 
 def position(lat_deg, sysid=1):
@@ -302,6 +304,17 @@ def position(lat_deg, sysid=1):
 
 def mission_request(seq):
     return make_msg(1, 1, "mission_request", 255, 191, seq)
+
+
+def latest(link, msg_type):
+    """link.latest(msg_type), which must have arrived."""
+    msg = link.latest(msg_type)
+    assert msg is not None, "no %s yet" % msg_type
+    return msg
+
+
+def alive(thread):
+    return thread is not None and thread.is_alive()
 
 
 def wait_until(predicate, timeout=2.0, interval=0.01):
@@ -317,8 +330,9 @@ def test_connect_heartbeat_is_cached_and_mode_mapping_delegates():
     master = FakeMaster([copter_heartbeat()])
     with connect(master) as link:
         assert link.is_up
-        assert link.latest("HEARTBEAT").get_srcSystem() == 1
-        assert link.mode_mapping()["AUTO"] == 3
+        assert latest(link, "HEARTBEAT").get_srcSystem() == 1
+        mapping = link.mode_mapping()
+        assert mapping is not None and mapping["AUTO"] == 3
     assert not link.is_up
 
 
@@ -327,10 +341,11 @@ def test_latest_returns_newest_and_age():
     with connect(master) as link:
         master.feed(position(35.01), position(35.02), position(35.03))
         assert wait_until(lambda: link.latest("GLOBAL_POSITION_INT") is not None
-                          and link.latest("GLOBAL_POSITION_INT").lat == int(35.03 * 1e7))
+                          and latest(link, "GLOBAL_POSITION_INT").lat == int(35.03 * 1e7))
 
         assert link.age("GLOBAL_POSITION_INT") < 0.5
         msg, rx_time = link.latest_with_time("GLOBAL_POSITION_INT")
+        assert msg is not None and rx_time is not None
         assert msg.lat == int(35.03 * 1e7)
         assert 0 <= time.monotonic() - rx_time < 0.5
 
@@ -350,7 +365,7 @@ def test_other_sysid_not_cached_but_delivered_to_subscribers():
             assert sub.get(timeout=1.0).get_srcSystem() == 255
             assert sub.get(timeout=1.0).get_srcSystem() == 255
         assert link.latest("GLOBAL_POSITION_INT") is None
-        assert link.latest("HEARTBEAT").get_srcSystem() == 1
+        assert latest(link, "HEARTBEAT").get_srcSystem() == 1
 
 
 def test_burst_delivered_in_order():
@@ -370,7 +385,7 @@ def test_subscription_only_receives_while_open():
             assert sub.get(timeout=1.0).seq == 0
 
         master.feed(mission_request(1))
-        assert wait_until(lambda: link.latest("MISSION_REQUEST").seq == 1)
+        assert wait_until(lambda: latest(link, "MISSION_REQUEST").seq == 1)
         with pytest.raises(queue.Empty):
             sub.get(timeout=0.05)
 
@@ -409,8 +424,8 @@ def test_handler_exception_does_not_stop_reader(caplog):
         with connect(master) as link:
             master.feed(poisoned, mavlink.MAVLink_bad_data(b"\x01\x02", "junk"), position(35.02))
             assert wait_until(lambda: link.latest("GLOBAL_POSITION_INT") is not None)
-            assert link.latest("GLOBAL_POSITION_INT").lat == int(35.02 * 1e7)
-            assert link._reader_thread.is_alive()
+            assert latest(link, "GLOBAL_POSITION_INT").lat == int(35.02 * 1e7)
+            assert alive(link._reader_thread)
 
     errors = [r for r in caplog.records if "Error handling received message" in r.getMessage()]
     assert len(errors) == 1
@@ -454,7 +469,7 @@ def test_reconnects_with_backoff_after_link_error():
         assert second.target_system == 1
 
         second.feed(position(35.09))
-        assert wait_until(lambda: link.latest("GLOBAL_POSITION_INT").lat == int(35.09 * 1e7))
+        assert wait_until(lambda: latest(link, "GLOBAL_POSITION_INT").lat == int(35.09 * 1e7))
         link.send("command_long_send", 1)
         assert second.mav.count("command_long_send") == 1
 
@@ -463,13 +478,13 @@ def test_close_stops_both_threads_quickly():
     master = FakeMaster([copter_heartbeat()])
     link = connect(master)
     reader, heartbeat = link._reader_thread, link._heartbeat_thread
-    assert reader.is_alive() and heartbeat.is_alive()
+    assert alive(reader) and alive(heartbeat)
 
     start = time.monotonic()
     link.close()
     assert time.monotonic() - start < 1.0
-    assert not reader.is_alive()
-    assert not heartbeat.is_alive()
+    assert not alive(reader)
+    assert not alive(heartbeat)
     link.close()
 
 
@@ -527,7 +542,7 @@ def test_connect_requests_default_streams():
     config = LinkConfig(device="fake", connect_timeout_s=2.0)
     with Link.connect(config, connection_factory=factory_for(master)) as link:
         assert link.latest("GLOBAL_POSITION_INT") is not None
-        assert link._stream_thread.is_alive()
+        assert alive(link._stream_thread)
     expected = [(getattr(mavlink, "MAVLINK_MSG_ID_" + name), 1e6 / rate)
                 for name, rate in config.stream_rates_hz.items()]
     assert interval_requests(master) == expected

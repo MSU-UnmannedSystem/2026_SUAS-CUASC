@@ -1,12 +1,11 @@
 import pytest
-from pymavlink import mavutil
 
 from mission_controller.vehicle.mission import (
     MissionItem, download_items, find_handover)
+from mission_controller.vehicle.dialect import mavlink
 
 from link_fakes import FakeLink, MissionSim
 
-mavlink = mavutil.mavlink
 REL = mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
 DROP_ALT = 7.62
 SERVO, PWM = 7, 1900
@@ -48,7 +47,9 @@ def good_mission():
 
 
 def find(items):
-    return find_handover(items, SERVO)
+    plan = find_handover(items, SERVO)
+    assert plan is not None
+    return plan
 
 
 def test_good_mission():
@@ -106,7 +107,7 @@ def test_first_handover_is_used():
 def test_no_handover(mutate):
     items = good_mission()
     mutate(items)
-    assert find(items) is None
+    assert find_handover(items, SERVO) is None
 
 
 def stored(items):

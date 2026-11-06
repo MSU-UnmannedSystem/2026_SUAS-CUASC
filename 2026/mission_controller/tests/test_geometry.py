@@ -9,8 +9,14 @@ W, H = 640, 480
 HFOV, VFOV = 65.0, 39.4
 
 
-def offset(x, y, alt=10.0, roll=0.0, pitch=0.0):
+def raw_offset(x, y, alt=10.0, roll=0.0, pitch=0.0):
     return pixel_to_ground_offset(x, y, W, H, alt, roll, pitch, HFOV, VFOV)
+
+
+def offset(x, y, alt=10.0, roll=0.0, pitch=0.0):
+    result = raw_offset(x, y, alt, roll, pitch)
+    assert result is not None
+    return result
 
 
 def test_image_centre_is_straight_below():
@@ -49,11 +55,11 @@ def test_roll_and_pitch_tilt_the_view():
 
 @pytest.mark.parametrize("alt", [0.0, -1.0])
 def test_no_offset_without_altitude(alt):
-    assert offset(W / 2, H / 2, alt=alt) is None
+    assert raw_offset(W / 2, H / 2, alt=alt) is None
 
 
 def test_too_steep_view_is_rejected():
-    assert offset(W, H / 2, roll=math.radians(60)) is None
+    assert raw_offset(W, H / 2, roll=math.radians(60)) is None
 
 
 def test_centering_velocity_proportional_then_clamped():

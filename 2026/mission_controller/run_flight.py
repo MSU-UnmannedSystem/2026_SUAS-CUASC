@@ -31,7 +31,9 @@ import os
 import platform
 import sys
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
+
+from pymavlink.dialects.v20.ardupilotmega import MAV_MODE_FLAG_SAFETY_ARMED
 
 # Run as a plain script: put the "2026" folder on sys.path for the package imports.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -122,6 +124,11 @@ def log_fc_setup(link: Link, config: HandoverConfig) -> List[str]:
     return warnings
 
 
+def is_armed(heartbeat: Any) -> bool:
+    """True if a HEARTBEAT says the vehicle is armed (False if there's no heartbeat)."""
+    return heartbeat is not None and bool(heartbeat.base_mode & MAV_MODE_FLAG_SAFETY_ARMED)
+
+
 def servo_output_us(link: Link, channel: int) -> Optional[int]:
     """Current PWM of a servo output from a fresh SERVO_OUTPUT_RAW, or None."""
     msg = link.latest_fresh("SERVO_OUTPUT_RAW", 1.0)
@@ -175,7 +182,7 @@ def wait_until_disarmed(link: Link, flown: bool = True) -> None:
     last_report = 0.0
     while True:
         hb = link.latest("HEARTBEAT")
-        armed = hb is not None and bool(hb.base_mode & commands.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        armed = is_armed(hb)
         pos = link.latest("GLOBAL_POSITION_INT")
         if armed and pos is not None and pos.relative_alt / 1000.0 > FLOWN_ALT_M:
             flown = True
@@ -314,8 +321,7 @@ def _run(args: argparse.Namespace, sim_target, run_log: flight_log.RunLog) -> in
         plan = load_handover(link, config)
         log_fc_setup(link, config)
         logger.info("Mode %s, %s", commands.current_mode(link),
-                    "armed" if link.latest("HEARTBEAT").base_mode
-                    & commands.mavlink.MAV_MODE_FLAG_SAFETY_ARMED else "disarmed")
+                    "armed" if is_armed(link.latest("HEARTBEAT")) else "disarmed")
 
         if sim_target is not None:
             from mission_controller.sitl.sim_detector import SimTargetDetector
@@ -357,6 +363,7 @@ def _run(args: argparse.Namespace, sim_target, run_log: flight_log.RunLog) -> in
             wait_until_disarmed(link, flown=False)
             logger.info("RUN SUMMARY: no handover in the mission, nothing sent")
             return 0
+        assert detector is not None  # set above for every run that gets here
         controller = HandoverController(link, detector, plan, config, trace=trace_csv.write)
         if controller.wait_for_handover():
             servo_before = servo_output_us(link, config.servo_channel)

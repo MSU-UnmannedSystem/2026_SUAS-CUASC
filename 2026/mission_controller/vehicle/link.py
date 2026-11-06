@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Tup
 
 from pymavlink import mavutil
 
+from mission_controller.vehicle.dialect import mavlink
+
 try:
     from serial import SerialException
 except ImportError:  # pyserial is optional (UDP/TCP-only installs)
@@ -73,7 +75,7 @@ def _raise_on_tcp_close(master: Any) -> None:
 
 
 def _message_id(msg_type: str) -> int:
-    msg_id = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_" + msg_type, None)
+    msg_id = getattr(mavlink, "MAVLINK_MSG_ID_" + msg_type, None)
     if msg_id is None:
         raise ValueError("Unknown MAVLink message type %r" % msg_type)
     return msg_id
@@ -112,7 +114,7 @@ class LinkConfig:
     # heartbeats alone held off the failsafe; it fired 5 s after they stopped.
     # TODO: check which name/value the Cube's firmware uses (`tools/sitl_link_check.py params`).
     source_system: int = 255
-    source_component: int = mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
+    source_component: int = mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
     expected_sysid: Optional[int] = None
     connect_timeout_s: float = 30.0
     heartbeat_hz: float = 2.0
@@ -178,11 +180,11 @@ class _HeartbeatThread(threading.Thread):
                 try:
                     self._link.send(
                         "heartbeat_send",
-                        type=mavutil.mavlink.MAV_TYPE_GCS,
-                        autopilot=mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                        type=mavlink.MAV_TYPE_GCS,
+                        autopilot=mavlink.MAV_AUTOPILOT_INVALID,
                         base_mode=0,
                         custom_mode=0,
-                        system_status=mavutil.mavlink.MAV_STATE_ACTIVE,
+                        system_status=mavlink.MAV_STATE_ACTIVE,
                     )
                 except Exception:
                     suppressed = self._error_log.allow()
@@ -368,9 +370,9 @@ class Link:
             if msg is None:
                 continue
             sysid, compid = msg.get_srcSystem(), msg.get_srcComponent()
-            if msg.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID:
+            if msg.autopilot == mavlink.MAV_AUTOPILOT_INVALID:
                 reason = "not an autopilot"
-            elif msg.type == mavutil.mavlink.MAV_TYPE_GCS:
+            elif msg.type == mavlink.MAV_TYPE_GCS:
                 reason = "GCS"
             elif cfg.expected_sysid is not None and sysid != cfg.expected_sysid:
                 reason = "sysid != expected %d" % cfg.expected_sysid
@@ -411,7 +413,7 @@ class Link:
     def _send_message_interval(self, msg_type: str, rate_hz: float) -> None:
         interval_us = 1e6 / rate_hz
         self.send("command_long_send", self._target_system, self._target_component,
-                  mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                  mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
                   float(_message_id(msg_type)), interval_us, 0, 0, 0, 0, 0)
         self._stream_requested_at[msg_type] = time.monotonic()
 
@@ -429,7 +431,7 @@ class Link:
                 except queue.Empty:
                     break
                 if (ack.get_srcSystem() == self._target_system
-                        and ack.command == mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL):
+                        and ack.command == mavlink.MAV_CMD_SET_MESSAGE_INTERVAL):
                     return ack.result
         return None
 
@@ -438,7 +440,7 @@ class Link:
             result = self._request_stream_acked(msg_type, rate_hz)
             if result is None:
                 logger.warning("No ACK for SET_MESSAGE_INTERVAL %s @ %g Hz", msg_type, rate_hz)
-            elif result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            elif result != mavlink.MAV_RESULT_ACCEPTED:
                 logger.warning("SET_MESSAGE_INTERVAL %s @ %g Hz rejected: result %d",
                                msg_type, rate_hz, result)
             else:
@@ -689,7 +691,7 @@ class Link:
             The message, or None if none has been seen or it is older than ``max_age_s``.
         """
         msg, rx_time = self.latest_with_time(msg_type)
-        if msg is None or time.monotonic() - rx_time > max_age_s:
+        if msg is None or rx_time is None or time.monotonic() - rx_time > max_age_s:
             return None
         return msg
 

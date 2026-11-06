@@ -28,8 +28,10 @@ def test_projection_round_trips_through_guidance_geometry(yaw_deg, roll_deg, pit
     at(link, -4.0, -3.0, 15.0, yaw, roll, pitch)   # target 4 m north, 3 m east of the drone
     det = SimTargetDetector(link, LAT, LON).detect()
     assert det is not None
-    fwd, right = pixel_to_ground_offset(det.x_px, det.y_px, det.width_px, det.height_px,
-                                        15.0, roll, pitch, 65.0, 39.4)
+    ground = pixel_to_ground_offset(det.x_px, det.y_px, det.width_px, det.height_px,
+                                    15.0, roll, pitch, 65.0, 39.4)
+    assert ground is not None
+    fwd, right = ground
     north = fwd * math.cos(yaw) - right * math.sin(yaw)
     east = fwd * math.sin(yaw) + right * math.cos(yaw)
     assert north == pytest.approx(4.0, abs=0.05)
@@ -60,11 +62,11 @@ def test_hide_after_simulates_lost_lock():
 
 def test_sim_target_refused_on_serial(monkeypatch, tmp_path):
     link = FakeLink(device="/dev/ttyTHS1")
-    link.closed = False
-    link.close = lambda: setattr(link, "closed", True)
+    closed = []
+    link.close = lambda: closed.append(True)
     monkeypatch.setattr(run_flight.Link, "connect", staticmethod(lambda config: link))
     assert run_flight.main(["--sim-target", "35.061,-118.157", "--log-dir", str(tmp_path)]) == 1
-    assert link.closed
+    assert closed
     assert link.calls == []
 
 

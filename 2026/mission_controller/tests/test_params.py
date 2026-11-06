@@ -34,8 +34,10 @@ def test_read_single_param():
 
 def test_read_prefers_earlier_name_when_both_exist():
     link = autopilot_with({"MAV_GCS_SYSID": 255.0, "SYSID_MYGCS": 254.0})
-    assert params.read_param(link, "MAV_GCS_SYSID", "SYSID_MYGCS").name == "MAV_GCS_SYSID"
-    assert params.read_param(link, "SYSID_MYGCS", "MAV_GCS_SYSID").name == "SYSID_MYGCS"
+    first = params.read_param(link, "MAV_GCS_SYSID", "SYSID_MYGCS")
+    second = params.read_param(link, "SYSID_MYGCS", "MAV_GCS_SYSID")
+    assert first is not None and first.name == "MAV_GCS_SYSID"
+    assert second is not None and second.name == "SYSID_MYGCS"
 
 
 def test_read_falls_back_to_later_name():

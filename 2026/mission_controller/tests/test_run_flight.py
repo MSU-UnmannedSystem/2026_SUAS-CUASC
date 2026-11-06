@@ -1,17 +1,17 @@
 import re
 import time
+from typing import Any, Dict
 from pathlib import Path
 
 import pytest
-from pymavlink import mavutil
 
 from mission_controller import run_flight
 from mission_controller.config.flight_params import HandoverConfig
+from mission_controller.vehicle.dialect import mavlink
 
 from link_fakes import FakeLink, NavGuidedVehicle
 from test_mission_check import good_mission
 
-mavlink = mavutil.mavlink
 PACKAGE = Path(__file__).resolve().parents[1]
 
 
@@ -34,6 +34,7 @@ def vehicle(background):
 def test_load_handover_sends_only_reads(vehicle):
     load(vehicle, good_mission())
     plan = run_flight.load_handover(vehicle.link, HandoverConfig())
+    assert plan is not None
     assert (plan.guided_seq, plan.release_seq, plan.resume_seq) == (5, 7, 8)
     sent = {c.method for c in vehicle.link.calls}
     assert sent <= {"mission_request_list_send", "mission_request_int_send", "mission_ack_send"}
@@ -145,8 +146,9 @@ from mission_controller.vision.detector import Detection  # noqa: E402
 GOOD_FC_PARAMS = {"SERIAL2_PROTOCOL": 2, "SERIAL2_BAUD": 921, "BRD_SER2_RTSCTS": 0,
                   "SERIAL2_OPTIONS": 0, "SYSID_MYGCS": 255, "GUID_TIMEOUT": 3,
                   "FS_GCS_ENABLE": 0, "FS_GCS_TIMEOUT": 5}
-FAST = dict(max_horizontal_speed_m_s=2.0, horizontal_gain_per_s=1.0, center_hold_s=0.2,
-            lost_lock_timeout_s=0.6, command_rate_hz=50.0)
+FAST: Dict[str, Any] = dict(
+    max_horizontal_speed_m_s=2.0, horizontal_gain_per_s=1.0, center_hold_s=0.2,
+    lost_lock_timeout_s=0.6, command_rate_hz=50.0)
 
 
 def hardware(vehicle, monkeypatch, **param_overrides):

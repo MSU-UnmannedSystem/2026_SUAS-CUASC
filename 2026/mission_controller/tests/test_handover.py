@@ -3,6 +3,7 @@
 import math
 import threading
 import time
+from typing import Any, Dict
 
 import pytest
 
@@ -17,8 +18,9 @@ PLAN = HandoverPlan(guided_seq=5, release_seq=7, resume_seq=8)
 SET_MISSION_CURRENT = 224
 
 # Same logic as the flight defaults, compressed in time so the suite stays fast.
-FAST = dict(max_horizontal_speed_m_s=2.0, horizontal_gain_per_s=1.0, center_hold_s=0.2,
-            lost_lock_timeout_s=0.6, command_rate_hz=50.0)
+FAST: Dict[str, Any] = dict(
+    max_horizontal_speed_m_s=2.0, horizontal_gain_per_s=1.0, center_hold_s=0.2,
+    lost_lock_timeout_s=0.6, command_rate_hz=50.0)
 
 
 # At the 7.62 m drop altitude the 65 x 39.4 deg camera sees only about +/-2.7 m
@@ -260,10 +262,11 @@ def test_trace_records_every_tick_through_to_the_lock(vehicle):
 
 def test_trace_records_search_while_target_is_lost(vehicle):
     rows = []
-    controller = HandoverController(vehicle.link, SimDetector(vehicle),
+    detector = SimDetector(vehicle)
+    controller = HandoverController(vehicle.link, detector,
                                     PLAN, HandoverConfig(**dict(FAST, lost_lock_timeout_s=0.3)),
                                     trace=rows.append)
-    controller.detector.visible = False
+    detector.visible = False
     assert controller.run() == handover.GAVE_UP
     assert {r["phase"] for r in rows[:-1]} == {"SEARCH"}
     assert rows[-1]["phase"] == handover.GAVE_UP and rows[-1]["lost_for_s"] >= 0.3
@@ -308,7 +311,10 @@ def test_bench_uses_the_bench_height(background):
     sim = bench_vehicle(background, target_north_m=2.0, target_east_m=0.0)
     rows = []
     controller = HandoverController(sim.link, SimDetector(sim), PLAN,
-                                    HandoverConfig(**dict(FAST, lost_lock_timeout_s=0.2)),
+                                    # The target starts inside the lock radius: a long hold
+                                    # keeps it from locking before it's hidden.
+                                    HandoverConfig(**dict(FAST, lost_lock_timeout_s=0.2,
+                                                          center_hold_s=5.0)),
                                     trace=rows.append, bench_alt_m=1.5)
     threading.Timer(0.2, lambda: setattr(controller.detector, "visible", False)).start()
     assert controller.run() == handover.GAVE_UP

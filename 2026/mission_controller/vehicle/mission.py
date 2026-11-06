@@ -12,14 +12,13 @@ import queue
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from pymavlink import mavutil
 
 from mission_controller.vehicle.commands import _enum_name
 from mission_controller.vehicle.link import Link, Subscription
+from mission_controller.vehicle.dialect import mavlink
 
 logger = logging.getLogger(__name__)
 
-mavlink = mavutil.mavlink
 
 # MAV_CMD ids below this are NAV commands (the mission's "path" items).
 _NAV_CMD_LAST = mavlink.MAV_CMD_NAV_LAST

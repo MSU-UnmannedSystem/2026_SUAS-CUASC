@@ -89,7 +89,7 @@ def test_telemetry_recorder_records_state_and_events(background, tmp_path, caplo
 
 def test_recorder_survives_errors(tmp_path):
     link = FakeLink()
-    link.latest_fresh = None  # broken: every sample raises
+    setattr(link, "latest_fresh", None)  # broken: every sample raises
     recorder = flight_log.TelemetryRecorder(link, str(tmp_path / "t.csv"), 7, rate_hz=50.0)
     recorder.start()
     time.sleep(0.1)

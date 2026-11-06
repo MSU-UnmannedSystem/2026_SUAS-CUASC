@@ -53,7 +53,7 @@ class VisionPipeline(TargetDetector):
         else:
             # V4L2 wants the pixel format before the size.
             if fourcc:
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*fourcc))
             if width:
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             if height:
@@ -127,7 +127,7 @@ class VisionPipeline(TargetDetector):
     def detect(self) -> Optional[Detection]:
         """TargetDetector API: the target in the newest frame, with frame size and capture time."""
         with self.lock:
-            if not self.ret or self.frame is None:
+            if not self.ret or self.frame is None or self.frame_time is None:
                 return None
             frame = self.frame.copy()
             frame_time = self.frame_time

@@ -1,3 +1,7 @@
+# FakeLink stands in for Link (see below): its plain attributes replace Link's
+# read-only properties, which type checkers would otherwise report.
+# pyright: reportIncompatibleMethodOverride=false, reportAssignmentType=false
+
 """Test doubles for code that uses the Link API (commands, params, mission, guidance).
 
 Messages are real pymavlink objects encoded with the MAVLink2 dialect (so
@@ -10,15 +14,16 @@ import contextlib
 import math
 import threading
 import time
+from typing import TYPE_CHECKING
 
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as mav2
 
-from mission_controller.vehicle.link import Subscription
-from mission_controller.vision.detector import Detection
+from mission_controller.vehicle.link import Link, Subscription
+from mission_controller.vision.detector import Detection, TargetDetector
+from mission_controller.vehicle.dialect import mavlink
 
-mavlink = mavutil.mavlink
-MODES = mavutil.mode_mapping_byname(mavlink.MAV_TYPE_QUADROTOR)
+MODES = mavutil.mode_mapping_byname(mavlink.MAV_TYPE_QUADROTOR) or {}
 
 SentCommand = collections.namedtuple("SentCommand", "command confirmation params")
 Call = collections.namedtuple("Call", "method args kwargs")
@@ -30,7 +35,9 @@ Call = collections.namedtuple("Call", "method args kwargs")
 def make_msg(sysid, compid, name, *fields, **kwargs):
     encoder = mav2.MAVLink(None, srcSystem=sysid, srcComponent=compid)
     msg = getattr(encoder, name + "_encode")(*fields, **kwargs)
-    return mav2.MAVLink(None).parse_buffer(bytes(msg.pack(encoder)))[0]
+    parsed = mav2.MAVLink(None).parse_buffer(bytes(msg.pack(encoder)))
+    assert parsed
+    return parsed[0]
 
 
 def heartbeat(mode="GUIDED", armed=False, sysid=1, compid=1):
@@ -100,8 +107,15 @@ def mission_current(seq, sysid=1):
 
 # --- FakeLink ---------------------------------------------------------------
 
+if TYPE_CHECKING:
+    # Type checkers treat FakeLink as a Link, so it can be passed wherever the
+    # code expects one. At runtime it's a plain class: nothing is inherited.
+    _LinkBase = Link
+else:
+    _LinkBase = object
 
-class FakeLink:
+
+class FakeLink(_LinkBase):
     """Implements the Link API; tests script the vehicle's replies.
 
     Every send is recorded in ``calls``; COMMAND_LONGs are also recorded in
@@ -184,7 +198,7 @@ class FakeLink:
 
     def latest_fresh(self, msg_type, max_age_s):
         msg, rx = self.latest_with_time(msg_type)
-        if msg is None or time.monotonic() - rx > max_age_s:
+        if msg is None or rx is None or time.monotonic() - rx > max_age_s:
             return None
         return msg
 
@@ -423,7 +437,7 @@ class NavGuidedVehicle:
         self.publish()
 
 
-class SimDetector:
+class SimDetector(TargetDetector):
     """Projects the NavGuidedVehicle's target into a 640x480 down-looking image.
 
     Uses the same pinhole model as guidance (level attitude). Returns None when

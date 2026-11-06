@@ -2,15 +2,13 @@ import logging
 import time
 
 import pytest
-from pymavlink import mavutil
 
 from mission_controller.vehicle import commands
 from mission_controller.vehicle.commands import (
     CommandDenied, CommandTimeout, StateNotReached)
+from mission_controller.vehicle.dialect import mavlink
 from link_fakes import (
     FakeLink, ack, heartbeat, later, mission_current, servo_output, statustext)
-
-mavlink = mavutil.mavlink
 
 
 # --- command_long -----------------------------------------------------------

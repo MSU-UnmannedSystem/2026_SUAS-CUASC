@@ -106,6 +106,13 @@ class HandoverController:
         self._start = time.monotonic()
         self._trace_failed = False
 
+    @property
+    def _flight_plan(self) -> HandoverPlan:
+        """The handover plan; only bench mode may run without one."""
+        if self.plan is None:
+            raise RuntimeError("no handover plan (bench mode without a mission)")
+        return self.plan
+
     # --- state ---------------------------------------------------------------
 
     def _armed(self) -> bool:
@@ -121,7 +128,7 @@ class HandoverController:
         if commands.current_mode(self.link) != "AUTO":
             return PILOT_TAKEOVER
         seq = commands.mission_current_seq(self.link)
-        if seq is not None and seq != self.plan.guided_seq:
+        if seq is not None and seq != self._flight_plan.guided_seq:
             return FC_ENDED
         return None
 
@@ -216,7 +223,7 @@ class HandoverController:
             True when the handover has started.
         """
         logger.info("Waiting for AUTO to reach NAV_GUIDED_ENABLE (seq %d); sending nothing",
-                    self.plan.guided_seq)
+                    self._flight_plan.guided_seq)
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         flew = False
         warned_past = False
@@ -229,15 +236,15 @@ class HandoverController:
                 logger.info("Vehicle landed and disarmed without reaching the handover")
                 return False
             seq = commands.mission_current_seq(self.link)
-            if seq is not None and seq > self.plan.guided_seq and not warned_past:
+            if seq is not None and seq > self._flight_plan.guided_seq and not warned_past:
                 logger.warning("Mission is already at item %d, past NAV_GUIDED_ENABLE (%d); "
                                "no handover this flight unless it is restarted", seq,
-                               self.plan.guided_seq)
+                               self._flight_plan.guided_seq)
                 warned_past = True
             if (armed and commands.current_mode(self.link) == "AUTO"
-                    and seq == self.plan.guided_seq):
+                    and seq == self._flight_plan.guided_seq):
                 logger.info("Handover started: AUTO is on NAV_GUIDED_ENABLE (seq %d)",
-                            self.plan.guided_seq)
+                            self._flight_plan.guided_seq)
                 return True
             time.sleep(poll_s)
         return False
@@ -325,10 +332,10 @@ class HandoverController:
     def _hand_back_item(self, release: bool) -> Tuple[int, str]:
         """(mission item to hand back at, why) for a release or a skip."""
         if not release:
-            return self.plan.resume_seq, "release skipped"
-        if self.plan.release_seq is None:
-            return self.plan.resume_seq, "no release item in the mission: nothing released"
-        return self.plan.release_seq, "DO_SET_SERVO: FC releases"
+            return self._flight_plan.resume_seq, "release skipped"
+        if self._flight_plan.release_seq is None:
+            return self._flight_plan.resume_seq, "no release item in the mission: nothing released"
+        return self._flight_plan.release_seq, "DO_SET_SERVO: FC releases"
 
     def _hand_back(self, release: bool, outcome: str) -> str:
         """Gives control back to the FC: at the DO_SET_SERVO (release) or past it."""
@@ -345,7 +352,7 @@ class HandoverController:
         seq, why = self._hand_back_item(release)
         logger.info("Handing back to the FC at item %d (%s)", seq, why)
         try:
-            commands.set_mission_current(self.link, seq, expect_seq=self.plan.resume_seq)
+            commands.set_mission_current(self.link, seq, expect_seq=self._flight_plan.resume_seq)
         except CommandError as e:
             # The FC's DO_GUIDED_LIMITS timeout still ends the handover (past the release,
             # via the guard DO_JUMP).

@@ -52,7 +52,7 @@ class SimTargetDetector(TargetDetector):
     def detect(self) -> Optional[Detection]:
         pos, pos_rx = self.link.latest_with_time("GLOBAL_POSITION_INT")
         att = self.link.latest("ATTITUDE")
-        if pos is None or att is None:
+        if pos is None or pos_rx is None or att is None:
             return None
         alt_m = pos.relative_alt / 1000.0
         if alt_m <= 0.5:

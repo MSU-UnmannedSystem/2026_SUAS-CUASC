@@ -10,14 +10,13 @@ import queue
 import time
 from typing import Dict, NamedTuple, Optional
 
-from pymavlink import mavutil
 
 from mission_controller.vehicle.commands import CommandError
 from mission_controller.vehicle.link import Link
+from mission_controller.vehicle.dialect import mavlink
 
 logger = logging.getLogger(__name__)
 
-mavlink = mavutil.mavlink
 
 # After the first PARAM_VALUE answer, how long to keep waiting for a
 # higher-priority name (ArduPilot answers reads within a few ms).
